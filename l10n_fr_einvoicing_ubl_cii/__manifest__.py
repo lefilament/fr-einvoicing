@@ -12,7 +12,7 @@
     "website": "https://github.com/lefilament/fr-einvoicing",
     "depends": [
         "l10n_fr_einvoicing",
-        "account_edi_ubl_cii",
+        "l10n_fr_account_ubl_cii",
     ],
     "excludes": ["account_peppol", "l10n_fr_pdp"],
     "data": [
