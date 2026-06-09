@@ -1,10 +1,14 @@
 # Copyright 2026 Le Filament (https://le-filament.com/)
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
-from odoo import api, models
+from odoo import api, fields, models
 
 
 class ResPartner(models.Model):
     _inherit = "res.partner"
+
+    invoice_sending_method = fields.Selection(
+        selection_add=[("fr_pa", "by French Accredited Platform")],
+    )
 
     def _l10n_fr_get_base_identifier(self):
         self.ensure_one()

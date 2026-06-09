@@ -35,6 +35,4 @@ class FrEinvoicingFlow(models.Model):
                 body=self.env._("Facture reçue depuis la PA"),
                 attachment_ids=attachment.ids,
             )
-            attachment.write({"res_model": "account.move", "res_id": invoice.id})
-            invoice_id = invoice.id
-        return invoice_id
+        return invoice.id
