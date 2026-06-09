@@ -6,6 +6,15 @@ from odoo import api, models
 class ResPartner(models.Model):
     _inherit = "res.partner"
 
+    def _l10n_fr_get_base_identifier(self):
+        self.ensure_one()
+        if siret := self._get_siret(raise_if_none=False):
+            return "siret", siret
+        elif siren := self._get_siren(raise_if_none=False):
+            return "siren", siren
+        else:
+            return super()._l10n_fr_get_base_identifier()
+
     # Overwrite functions from account_edi_ubl_cii to compute eas and endpoint based
     # on default_fr_directory_line_id
     def _peppol_eas_endpoint_depends(self):
