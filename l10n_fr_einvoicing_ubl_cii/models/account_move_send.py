@@ -56,6 +56,10 @@ class AccountMoveSend(models.AbstractModel):
         # EXTENDS 'account'
         res = super()._call_web_service_after_invoice_pdf_render(invoices_data)
 
+        # In case we come from flow generation, do not automatically send to PA
+        if self.env.context.get("fr_einvoicing_flow_generate", False):
+            return res
+
         for invoice, invoice_data in invoices_data.items():
             if "fr_pa" in invoice_data["sending_methods"]:
                 if not self._is_applicable_to_move("fr_pa", invoice, **invoice_data):

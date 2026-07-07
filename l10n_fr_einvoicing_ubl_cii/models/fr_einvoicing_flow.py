@@ -25,7 +25,16 @@ class FrEinvoicingFlow(models.Model):
         self.ensure_one()
         # If PDF and XML have not yet been generated, we force generation
         if not self.move_id.invoice_pdf_report_id or not self.move_id.ubl_cii_xml_id:
-            self.env["account.move.send"]._generate_and_send_invoices(self.move_id)
+            move_data = {
+                self.move_id.sudo(): {
+                    **self.env["account.move.send"]._get_default_sending_settings(
+                        self.move_id
+                    ),
+                }
+            }
+            self.env["account.move.send"].with_context(
+                fr_einvoicing_flow_generate=True
+            )._generate_invoice_documents(move_data)
         if self.syntax == "Factur-X" and self.move_id.invoice_pdf_report_id:
             extension = "pdf"
             file_b64 = self.move_id.invoice_pdf_report_id.datas

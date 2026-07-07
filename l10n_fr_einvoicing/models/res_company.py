@@ -511,10 +511,11 @@ class ResCompany(models.Model):
         if self.fr_ctc_accredited_platform == "superpdp":
             running_env = tools.config.get("running_env")
             siren = self.partner_id._get_siren(raise_if_none=True)
-            optional_uri_params = {"superpdp_company_number": siren}
             if running_env in ("test", "dev"):
+                optional_uri_params = {"superpdp_company_number": "000000001"}
                 optional_uri_params["superpdp_company_number_scheme"] = "sandbox"
             else:
+                optional_uri_params = {"superpdp_company_number": siren}
                 optional_uri_params["superpdp_company_number_scheme"] = "fr_siren"
         redirect_uri = self._fr_ctc_redirect_uri()
         authorization_url, state, code_verifier = get_authorization_url(
