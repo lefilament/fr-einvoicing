@@ -961,13 +961,18 @@ class AccountMove(models.Model):
             )
             pdf_writer.write(pdf_bytesio)
 
+    def _get_name_invoice_report(self):
+        """Overrides default method from account module"""
+        self.ensure_one()
+        return "account.report_invoice_with_payments"
+
     def _get_pdf_invoice_bin(self):
         """This works with both qweb and py3o"""
         self.ensure_one()
         pdf_invoice_bin, _filetype = (
             self.env["ir.actions.report"]
             .with_context(regular_pdf_invoice=True)
-            ._render("account.report_invoice_with_payments", [self.id])
+            ._render(self._get_name_invoice_report(), [self.id])
         )
         return pdf_invoice_bin
 

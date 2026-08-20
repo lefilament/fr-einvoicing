@@ -287,19 +287,24 @@ class FrEinvoicingFlow(models.Model):
             move = self.move_ids
             if self.syntax in ("Factur-X", "UBL", "CII"):
                 filename = move._prepare_en16931_filename(self.odoo_invoice_format)
-                try:
-                    file_b64 = move._get_en16931_invoice_bin(
-                        self.odoo_invoice_format, b64=True
-                    )
-                except Exception as err:
-                    msg = (
-                        f"Error in the generation of the {self.syntax} file for "
-                        f"flow {self.display_name} ID {self.id}: {err}"
-                    )
-                    log_obj._error_log(result, msg)
-                    vals = {"state": "error", "odoo_error_details": str(err)}
-                    self.sudo().write(vals)
-                    return
+                if self.syntax == "Factur-x" and move.invoice_pdf_report_id:
+                    file_b64 = move.invoice_pdf_report_id.datas
+                elif self.syntax in ("UBL", "CII") and move.ubl_cii_xml_id:
+                    file_b64 = move.ubl_cii_xml_id.datas
+                else:
+                    try:
+                        file_b64 = move._get_en16931_invoice_bin(
+                            self.odoo_invoice_format, b64=True
+                        )
+                    except Exception as err:
+                        msg = (
+                            f"Error in the generation of the {self.syntax} file for "
+                            f"flow {self.display_name} ID {self.id}: {err}"
+                        )
+                        log_obj._error_log(result, msg)
+                        vals = {"state": "error", "odoo_error_details": str(err)}
+                        self.sudo().write(vals)
+                        return
             else:
                 raise ValueError(
                     f"Syntax '{self.syntax}' is not applicable for invoices"
