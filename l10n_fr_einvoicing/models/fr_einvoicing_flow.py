@@ -7,9 +7,14 @@ import logging
 import time
 
 from markupsafe import Markup
+from stdnum.fr.siren import is_valid as siren_is_valid
+from stdnum.fr.siren import to_tva as siren_to_vat
+from stdnum.fr.siret import is_valid as siret_is_valid
 
 from odoo import Command, api, fields, models
 from odoo.exceptions import UserError
+
+from .res_partner import SUPERPDP_SANDBOX_SIREN
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +98,16 @@ class FrEinvoicingFlow(models.Model):
         ],
         readonly=True,
     )
+    odoo_invoice_format = fields.Selection(
+        [
+            ("facturx", "Factur-X"),
+            ("ubl_pdf", "UBL XML with embedded PDF file"),
+            ("ubl", "UBL XML"),
+            ("cii_pdf", "CII XML with embedded PDF file"),
+            ("cii", "CII XML"),
+        ],
+        readonly=True,
+    )  # Only for out flows, when syntax in (UBL, CII, Factur-X)
     profile = fields.Selection(
         [  # flowProfile
             ("Basic", "Basic"),
@@ -106,16 +121,21 @@ class FrEinvoicingFlow(models.Model):
             ("B2B", "B2B Invoicing"),
             ("B2BInt", "International B2B e-Reporting"),
             ("B2C", "B2C e-Reporting"),
-            ("B2G", "B2G e-Invoicing"),
+            ("B2G", "B2G Invoicing"),
             ("B2GInt", "International B2G"),  # ??
             ("OutOfScope", "Out of scope (not regulated flow)"),
             ("B2GOutOfScope", "B2G Out of scope"),
             ("ArchiveOnly", "Archive only, no transmission"),
             ("NotApplicable", "Not Applicable"),
+            (
+                "Undefined",
+                "Not yet defined when in Pending state or unable to define "
+                "when in Error state",
+            ),
         ],
         readonly=True,
     )
-    submitted_at = fields.Datetime(readonly=True)  # SumittedAt
+    submitted_at = fields.Datetime(readonly=True)  # SubmittedAt
     updated_at = fields.Datetime(
         readonly=True, help="Last update of the flow"
     )  # UpdatedAt
@@ -149,6 +169,9 @@ class FrEinvoicingFlow(models.Model):
     event_id = fields.Many2one(
         "fr.einvoicing.event", compute="_compute_event_id", store=True
     )
+    auto_internal_move_id = fields.Many2one(
+        "account.move", string="Auto-generated Internal Refund/Invoice", readonly=True
+    )
     # state côté PA / côté Odoo ?
     # initial M2M
     # O2M
@@ -167,7 +190,9 @@ class FrEinvoicingFlow(models.Model):
         for flow in self:
             name = flow.identifier
             if not name:
-                name = self.env._("ID %s: to send", flow.id)
+                name = self.env._("ID %s", flow.id)
+            if flow.syntax:
+                name = f"{name} {flow.syntax}"
             if flow.state:
                 name = f"{name} ({state2label.get(flow.state)})"
             flow.display_name = name
@@ -237,7 +262,7 @@ class FrEinvoicingFlow(models.Model):
         if self.event_ids:
             assert len(self.event_ids) == 1
             event = self.event_ids
-            saxon_server_url = move_obj._get_saxon_server_url()
+            saxon_server_url = move_obj._get_specific_saxon_server_url()
             try:
                 data_dict = event._prepare_xml_data()
                 xml_bytes = generate_cdar(
@@ -260,55 +285,25 @@ class FrEinvoicingFlow(models.Model):
         elif self.move_ids:
             assert len(self.move_ids) == 1
             move = self.move_ids
-            if self.syntax == "Factur-X":
-                extension = "pdf"
+            if self.syntax in ("Factur-X", "UBL", "CII"):
+                filename = move._prepare_en16931_filename(self.odoo_invoice_format)
                 try:
-                    file_bin, filetype = self.env["ir.actions.report"]._render(
-                        "account.report_invoice_with_payments", [move.id]
+                    file_b64 = move._get_en16931_invoice_bin(
+                        self.odoo_invoice_format, b64=True
                     )
-                    assert filetype == "pdf", "wrong filetype"
-                    file_b64 = base64.b64encode(file_bin)
                 except Exception as err:
                     msg = (
-                        f"Error in the generation of the Factur-X file for "
+                        f"Error in the generation of the {self.syntax} file for "
                         f"flow {self.display_name} ID {self.id}: {err}"
                     )
                     log_obj._error_log(result, msg)
                     vals = {"state": "error", "odoo_error_details": str(err)}
                     self.sudo().write(vals)
                     return
-            elif self.syntax == "UBL":
-                extension = "xml"
-                try:
-                    file_bin = move.generate_ubl_xml_string()
-                    # xsl_schematron_path = "_XSLT/EN16931-UBL-validation.xslt"
-                    # self._check_schematron(file_bin, xsl_schematron_path)
-                    file_b64 = base64.b64encode(file_bin)
-                except Exception as err:
-                    msg = (
-                        f"Error in the generation of the UBL file for "
-                        f"flow {self.display_name} ID {self.id}: {err}"
-                    )
-                    log_obj._error_log(result, msg)
-                    vals = {"state": "error", "odoo_error_details": str(err)}
-                    self.sudo().write(vals)
-                    return
-
-            elif self.syntax == "CII":
-                extension = "xml"
-                try:
-                    file_bin = move.generate_facturx_xml()
-                    file_b64 = base64.b64encode(file_bin)
-                except Exception as err:
-                    msg = (
-                        f"Error in the generation of the CII file for "
-                        f"flow {self.display_name} ID {self.id}: {err}"
-                    )
-                    log_obj._error_log(result, msg)
-                    vals = {"state": "error", "odoo_error_details": str(err)}
-                    self.sudo().write(vals)
-                    return
-            filename = f"{move.name}.{extension}"
+            else:
+                raise ValueError(
+                    f"Syntax '{self.syntax}' is not applicable for invoices"
+                )
         else:
             raise UserError(
                 self.env._(
@@ -322,6 +317,11 @@ class FrEinvoicingFlow(models.Model):
             "filename": filename,
         }
         self.sudo().write(vals)
+        msg = (
+            f"Flow {self.display_name} ID {self.id} successfully generated "
+            f"in syntax {self.syntax}"
+        )
+        log_obj._info_log(result, msg)
         if "updated_count" in result:
             result["updated_count"] += 1
 
@@ -431,7 +431,7 @@ class FrEinvoicingFlow(models.Model):
             log_obj._warning_log(result, msg)
             return
         if self.identifier:
-            msg(
+            msg = (
                 f"Skip sending of flow {self.display_name} ID {self.id} because it "
                 "already has an identifier, which means it has already been sent"
             )
@@ -461,6 +461,8 @@ class FrEinvoicingFlow(models.Model):
             "odoo_error_details": False,
         }
         self.sudo().write(flow_vals)
+        msg = f"Flow {self.display_name} ID {self.id} successfully sent"
+        log_obj._info_log(result, msg)
         if "updated_count" in result:
             result["updated_count"] += 1
         if self.move_ids:
@@ -575,7 +577,7 @@ class FrEinvoicingFlow(models.Model):
         self.ensure_one()
         return False
 
-    def _process(self, result):
+    def _process(self, result):  # noqa: C901
         self.ensure_one()
         log_obj = self.env["fr.einvoicing.log"]
         if self.direction != "in":
@@ -602,13 +604,14 @@ class FrEinvoicingFlow(models.Model):
         msg = f"Start to process flow {self.display_name} ID {self.id} type {self.type}"
         log_obj._info_log(result, msg)
         if self.type == "SupplierInvoice":
-            move_id = err = None
+            move_id = error = None
             try:
                 move_id = self._import_supplier_invoice(result)
             except Exception as err:
+                error = str(err)
                 msg = (
                     f"Error in creation of the supplier invoice/refund from flow "
-                    f"{self.display_name} ID {self.id}: {err}"
+                    f"{self.display_name} ID {self.id}: {error}"
                 )
                 log_obj._warning_log(result, msg)
             if move_id:
@@ -625,8 +628,8 @@ class FrEinvoicingFlow(models.Model):
                     log_obj._info_log(result, msg)
             else:
                 err_details = "Odoo failed to created the supplier invoice/refund."
-                if err:
-                    err_details += f" Error: {err}"
+                if error:
+                    err_details += f" Error: {error}"
                 flow_vals = {
                     "state": "error",
                     "odoo_error_details": err_details,
@@ -668,8 +671,23 @@ class FrEinvoicingFlow(models.Model):
             if event_dict:
                 move = self._match_invoice_from_event(event_dict, result)
                 if move:
-                    self._create_event(event_dict, move)
+                    event = self._create_event(event_dict, move)
                     flow_vals = {"state": "done"}
+                    if (
+                        event.status in ("refused", "rejected")
+                        and self.company_id.fr_ctc_auto_reverse
+                    ):
+                        try:
+                            flow_vals["auto_internal_move_id"] = (
+                                self._auto_reverse_invoice(event, result)
+                            )
+                        except Exception as err:
+                            msg = (
+                                f"Auto-reverse triggered by event {event.display_name} "
+                                f"ID {event.id} failed. Error: {str(err)}"
+                            )
+                            log_obj._warning_log(result, msg)
+
                     if "updated_count" in result:
                         result["updated_count"] += 1
                 else:
@@ -722,26 +740,55 @@ class FrEinvoicingFlow(models.Model):
         partner = None
         invoice_issuer = event_dict.get("invoice_issuer")
         if invoice_issuer:
-            partner_dict = {}
-            if invoice_issuer.get("0002"):
-                partner_dict["siren"] = invoice_issuer["0002"]
+            base_domain = [
+                ("parent_id", "=", False),
+                ("company_id", "in", (False, self.company_id.id)),
+            ]
             if invoice_issuer.get("0009"):
-                partner_dict["siret"] = invoice_issuer["0009"]
-            chatter_msg = []
-            partner = self.env["business.document.import"]._match_partner(
-                partner_dict, chatter_msg, raise_exception=False
-            )
-            logger.debug("Trying to find partner with %s", partner_dict)
-            for to_log in chatter_msg:
-                logger.debug(to_log)
-            if partner:
-                msg = (
-                    f"Partner {partner.display_name} ID {partner.id} "
-                    f"found with {partner_dict}"
-                )
-                log_obj._info_log(result, msg)
-            else:
-                msg = f"No partner found with {partner_dict}"
+                siret = invoice_issuer["0009"].replace(" ", "")
+                if not siret_is_valid(siret):
+                    msg = f"SIRET {siret} written in event file is invalid"
+                    log_obj._warning_log(result, msg)
+                else:
+                    partner = self.env["res.partner"].search(
+                        base_domain + [("siret", "=", siret)], limit=1
+                    )
+                    if partner:
+                        msg = (
+                            f"Partner {partner.display_name} ID {partner.id} "
+                            f"found with SIRET {siret}"
+                        )
+                        log_obj._info_log(result, msg)
+            siren = False
+            if not partner and invoice_issuer.get("0002"):
+                siren = invoice_issuer["0002"].replace(" ", "")
+                if not siren_is_valid(siren) and siren not in SUPERPDP_SANDBOX_SIREN:
+                    msg = f"SIREN {siren} written in event file is invalid."
+                    log_obj._warning_log(result, msg)
+                else:
+                    partner = self.env["res.partner"].search(
+                        base_domain + [("siren", "=", siren)], limit=1
+                    )
+                    if partner:
+                        msg = (
+                            f"Partner {partner.display_name} ID {partner.id} "
+                            f"found with SIREN {siren}"
+                        )
+                        log_obj._info_log(result, msg)
+                    else:
+                        # French VAT number computed from SIREN
+                        vat = f"FR{siren_to_vat(siren)}"
+                        partner = self.env["res.partner"].search(
+                            base_domain + [("vat", "=", vat)], limit=1
+                        )
+                        if partner:
+                            msg = (
+                                f"Partner {partner.display_name} ID {partner.id} "
+                                f"found with VAT {vat} computed from SIREN {siren}"
+                            )
+                            log_obj._info_log(result, msg)
+            if not partner:
+                msg = f"No partner found with SIREN {siren}"
                 log_obj._warning_log(result, msg)
         return partner
 
@@ -792,6 +839,90 @@ class FrEinvoicingFlow(models.Model):
                 )
             )
         return event
+
+    def _auto_reverse_invoice(self, event, result):
+        move = event.move_id
+        log_obj = self.env["fr.einvoicing.log"]
+        if not move.is_sale_document():
+            msg = (
+                f"No auto-reversal because invoice {move.display_name} ID {move.id} "
+                f"is not a sale document"
+            )
+            log_obj._warning_log(result, msg)
+            return False
+        elif move.state != "posted":
+            msg = (
+                f"No auto-reversal because invoice {move.display_name} "
+                f"ID {move.id} has state={move.state}"
+            )
+            log_obj._warning_log(result, msg)
+            return False
+        if move.reversal_move_ids:
+            msg = (
+                f"No auto-reversal because invoice {move.display_name} "
+                f"ID {move.id} has already been reversed"
+            )
+            log_obj._warning_log(result, msg)
+            return False
+        lang = move.partner_id.lang
+        status_label = dict(
+            event._fields["status"]._description_selection(
+                self.with_context(lang=lang).env
+            )
+        ).get(event.status)
+        default_reverse_vals = {
+            "fr_einvoicing_internal": True,
+            "invoice_origin": self.env._(
+                "Auto-reverse on %(status)s event", status=status_label
+            ),
+            "ref": self.with_context(lang=lang).env._(
+                "Reversal of %(move)s following %(status)s event",
+                status=status_label,
+                move=move.display_name,
+            ),
+        }
+        reversed_move = move._reverse_moves([default_reverse_vals], cancel=True)
+        reversed_move.message_post(
+            body=Markup(
+                self.env._(
+                    "Auto-created because the option "
+                    "<strong>Auto Reverse Invoice if Refused/Rejected</strong> "
+                    "is enabled and event "
+                    "<a href=# data-oe-model=fr.einvoicing.event "
+                    "data-oe-id=%(event_id)s>%(event)s</a> has been received on "
+                    "<a href=# data-oe-model=account.move "
+                    "data-oe-id=%(move_id)s>%(move)s</a>.",
+                    event_id=event.id,
+                    event=event.display_name,
+                    move_id=move.id,
+                    move=move.display_name,
+                )
+            )
+        )
+        move.message_post(
+            body=Markup(
+                self.env._(
+                    "Auto-reversed by "
+                    "<a href=# data-oe-model=account.move "
+                    "data-oe-id=%(reversed_move_id)s>%(reversed_move)s</a> because "
+                    "the option <strong>Auto Reverse Invoice if "
+                    "Refused/Rejected</strong> is enabled and event "
+                    "<a href=# data-oe-model=fr.einvoicing.event "
+                    "data-oe-id=%(event_id)s>%(event)s</a> has been received "
+                    "on this invoice.",
+                    event_id=event.id,
+                    event=event.display_name,
+                    reversed_move_id=reversed_move.id,
+                    reversed_move=reversed_move.display_name,
+                )
+            )
+        )
+        msg = (
+            f"Invoice {move.display_name} ID {move.id} has been auto-reversed: "
+            f"{reversed_move.display_name} ID {reversed_move.id}"
+        )
+        log_obj._info_log(result, msg)
+        return reversed_move.id
 
     def _prepare_event(self, event_dict, move):
         event_obj = self.env["fr.einvoicing.event"]
@@ -916,9 +1047,10 @@ class FrEinvoicingFlow(models.Model):
             self.sudo().write(vals)
         if vals.get("state"):
             msg = (
-                f"Successful status update of flow {self.display_name} ID {self.id}. "
-                f"New state: '{vals['state']}'"
+                f"Successful status update of flow {self.display_name} ID {self.id}: "
+                f"new state is '{vals['state']}'"
             )
+            log_obj._info_log(result, msg)
             if "updated_count" in result:
                 result["updated_count"] += 1
 

@@ -23,9 +23,53 @@ logger = logging.getLogger(__name__)
 class AccountMoveLine(models.Model):
     _inherit = "account.move.line"
 
+    def _en16931_get_vat_taxes(self):
+        """Method designed to be inherited to support exotic setups"""
+        self.ensure_one()
+        return self.tax_ids.filtered(lambda x: x.unece_type_code == "VAT")
+
+    def _post_check_en16931_sale_document(self, errors):
+        self.ensure_one()
+        assert self.display_type == "product"
+        for tax in self.tax_ids:
+            # either we check both active and inactive taxes in
+            # company_id._en16931_checks() or we block invoice validation
+            # on inactive taxes
+            if not tax.active:
+                errors.append(
+                    self.env._(
+                        "Invoice line '%(inv_line)s' has tax '%(tax)s' "
+                        "which is not active.",
+                        inv_line=self.display_name,
+                        tax=tax.display_name,
+                    )
+                )
+        vat_taxes = self._en16931_get_vat_taxes()
+        if not vat_taxes:
+            errors.append(
+                self.env._(
+                    "There is no VAT tax on invoice line '%(inv_line)s'. "
+                    "You must set a VAT tax on "
+                    "each invoice line in company '%(company)s' because "
+                    "it is a VAT-registered company.",
+                    inv_line=self.display_name,
+                    company=self.company_id.display_name,
+                )
+            )
+        elif len(vat_taxes) > 1:
+            errors.append(
+                self.env._(
+                    "Invoice line '%(inv_line)s' has several "
+                    "VAT taxes (%(vat_taxes)s). EN16931 only "
+                    "allows one VAT tax.",
+                    inv_line=self.display_name,
+                    vat_taxes=", ".join([tax.display_name for tax in vat_taxes]),
+                )
+            )
+
     def _check_en16931(self, speedy):
         self.ensure_one()
-        vat_tax = self.tax_ids.filtered(lambda x: x.unece_type_code == "VAT")
+        vat_tax = self._en16931_get_vat_taxes()
         if speedy["company_no_vat_taxes"]:
             assert not vat_tax
             vat_dict = speedy["vat_info4company_no_vat_taxes"]
@@ -45,11 +89,12 @@ class AccountMoveLine(models.Model):
                 )
             assert vat_tax.unece_categ_code
             vat_dict = {"categ_code": vat_tax.unece_categ_code}
-            if vat_tax.unece_categ_code == "S":
+            if vat_tax.unece_categ_code != "O":
                 vat_dict["vat_rate"] = vat_tax.amount
-            elif vat_tax.unece_categ_code not in ("S", "Z"):
+            if vat_tax.unece_categ_code not in ("S", "Z"):
                 assert vat_tax.unece_vatex_code
                 vat_dict["vatex_code"] = vat_tax.unece_vatex_code
+                vat_dict["vatex_label"] = vat_tax.unece_vatex_id.name
 
         base_line = self.move_id._prepare_product_base_line_for_taxes_computation(self)
         self.env["account.tax"]._add_tax_details_in_base_lines(
@@ -134,6 +179,11 @@ class AccountMoveLine(models.Model):
                 }
             )
         line_total = self.price_subtotal + sum([x["tax_amount"] for x in non_vat_taxes])
+        vat_rate = (
+            isinstance(vat_dict.get("vat_rate"), int | float)
+            and speedy["tax_rate_fmt"] % vat_dict["vat_rate"]
+            or None
+        )
         vals = {
             "BT-126": str(line_number),
             "BT-153": self.name or speedy["invoice_line_missing_label"],
@@ -143,7 +193,7 @@ class AccountMoveLine(models.Model):
             "BT-129": speedy["qty_fmt"] % self.quantity,
             "BT-131": self.currency_id._en16931_format(line_total),
             "BT-151": vat_dict["categ_code"],
-            "BT-152": speedy["tax_rate_fmt"] % vat_dict.get("vat_rate"),
+            "BT-152": vat_rate,
             "EXT-FR-FE-178": vat_dict.get("vatex_label"),
             "EXT-FR-FE-179": vat_dict.get("vatex_code"),
             "BG-28": bg28,
@@ -172,10 +222,13 @@ class AccountMoveLine(models.Model):
             if product.default_code:
                 vals["BT-155"] = product.default_code
             if product.product_template_attribute_value_ids:
-                vals["BG-32"] = {
-                    attrib_val.product_attribute_value_id.attribute_id.name: attrib_val.product_attribute_value_id.name
-                    for attrib_val in product.product_template_attribute_value_ids
-                }
+                vals["BG-32"] = {}
+                for attrib_val in product.product_template_attribute_value_ids:
+                    attrib_name = (
+                        attrib_val.product_attribute_value_id.attribute_id.name
+                    )
+                    value_name = attrib_val.product_attribute_value_id.name
+                    vals["BG-32"][attrib_name] = value_name
 
         # OCA module account_invoice_start_end_dates
         if (
@@ -194,11 +247,16 @@ class AccountMoveLine(models.Model):
         res = []
         vat_dict, non_vat_taxes, base_line = self._check_en16931(speedy)
         bt92 = self.price_subtotal * -1
+        vat_rate = (
+            isinstance(vat_dict.get("vat_rate"), int | float)
+            and speedy["tax_rate_fmt"] % vat_dict["vat_rate"]
+            or None
+        )
         vals = {
             "BT-92": self.currency_id._en16931_format(bt92),
             "BT-97": self.name or speedy["invoice_line_missing_label"],
             "BT-95": vat_dict["categ_code"],
-            "BT-96": speedy["tax_rate_fmt"] % vat_dict.get("vat_rate"),
+            "BT-96": vat_rate,
             "BT-174": vat_dict.get("vatex_code"),
             "BT-173": vat_dict.get("vatex_label"),
         }

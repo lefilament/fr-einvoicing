@@ -6,6 +6,9 @@ import logging
 from datetime import timedelta
 
 from markupsafe import Markup
+from stdnum.fr.siren import is_valid as siren_is_valid
+from stdnum.fr.siret import is_valid as siret_is_valid
+from stdnum.vatin import is_valid as vat_is_valid
 
 from odoo import api, fields, models
 from odoo.exceptions import UserError, ValidationError
@@ -14,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_UPDATE_PARTNER_IF_OLDER_THAN_DAYS = 30
 DEFAULT_UPDATE_PRIVATE_INACTIVE_PARTNER_IF_OLDER_THAN_DAYS = 5
+SUPERPDP_SANDBOX_SIREN = ("000000001", "000000002")
 
 try:
     from pyfrctc import (
@@ -101,6 +105,10 @@ class ResPartner(models.Model):
     )
     fr_directory_show_warning_missing_siren = fields.Boolean(
         compute="_compute_fr_directory_show_warning_missing_siren"
+    )
+    fr_directory_show_warning_closed = fields.Boolean(
+        related="commercial_partner_id.fr_directory_closed",
+        string="Display warning for closed entity",
     )
 
     @api.depends("type", "parent_id", "fr_directory_entity_type", "fr_directory_closed")
@@ -229,7 +237,7 @@ class ResPartner(models.Model):
 
     def _fr_directory_chatter_log(self, origin, result):
         self.ensure_one()
-        msg_list = [self.env._("Get/update of directory lines. Origin: %s.", origin)]
+        msg_list = [self.env._("Directory sync. Origin: %s.", origin)]
         if result["new_count"]:
             msg_list.append(
                 self.env._("%s directory lines created.", result["new_count"])
@@ -244,7 +252,7 @@ class ResPartner(models.Model):
 
     @api.model
     def _fr_directory_sync_cron(self):
-        logger.info("Start FR eInvoicing directory update cron")
+        logger.info("Start FR eInvoicing directory sync cron")
         log_obj = self.env["fr.einvoicing.log"]
         result = {
             "log_type": "directory_all",
@@ -263,7 +271,7 @@ class ResPartner(models.Model):
             log_obj._create_log(result)
             return
         days_active, days_inactive = self._fr_directory_sync_if_old_get_days(result)
-        log_obj._info_log(result, "Start of the directory update cron.")
+        log_obj._info_log(result, "Start of the directory sync cron.")
         log_obj._info_log(
             result,
             f"Partners with active directory lines with last update date older "
@@ -301,7 +309,7 @@ class ResPartner(models.Model):
         fr_domain = [
             ("parent_id", "=", False),
             ("fr_directory_entity_type", "=", False),
-            ("country_id", "in", fr_country_codes),
+            ("country_id.code", "in", fr_country_codes),
             "|",
             ("vat", "!=", False),
             ("siren", "!=", False),
@@ -310,9 +318,9 @@ class ResPartner(models.Model):
             fr_domain, "from France with SIREN or VAT number", session, result
         )
 
-        log_obj._info_log(result, "End of the directory update cron.")
+        log_obj._info_log(result, "End of the directory sync cron.")
         log_obj._create_log(result)
-        logger.info("End of FR eInvoicing directory update cron")
+        logger.info("End of FR eInvoicing directory sync cron")
 
     @api.model
     def _fr_directory_cron_sync_partners(self, domain, partner_type, session, result):
@@ -326,7 +334,7 @@ class ResPartner(models.Model):
                 partner._fr_directory_sync(session, result)
             except Exception as e:
                 msg = (
-                    f"Directory update for partner {partner.display_name} "
+                    f"Directory sync for partner {partner.display_name} "
                     f"ID {partner.id} failed. Error: {str(e)}"
                 )
                 log_obj._warning_log(result, msg)
@@ -373,7 +381,7 @@ class ResPartner(models.Model):
             res.append(days)
         return res
 
-    def _fr_directory_sync(self, session, result):
+    def _fr_directory_sync(self, session, result):  # noqa: C901
         self.ensure_one()
         assert not self.parent_id
         log_obj = self.env["fr.einvoicing.log"]
@@ -383,7 +391,7 @@ class ResPartner(models.Model):
             "tag": "display_notification",
             "params": {
                 "type": "success",  # changed to warning/danger below if needed
-                "title": self.env._("Directory Updated"),
+                "title": self.env._("Directory Synced"),
                 "next": {
                     "type": "ir.actions.client",
                     "tag": "soft_reload",
@@ -394,7 +402,7 @@ class ResPartner(models.Model):
         err_msg = self._fr_directory_siren_change_error(siren=siren)
         if err_msg:
             raise UserError(err_msg)
-        if siren in ("000000001", "000000002"):
+        if siren in SUPERPDP_SANDBOX_SIREN:
             msg = (
                 f"SUPER PDP demo partner {self.display_name} SIREN {siren} "
                 "is not in the directory"
@@ -640,3 +648,266 @@ class ResPartner(models.Model):
             )
             return err_msg
         return None
+
+    def _fr_directory_check_siren_siret_vat(self):  # noqa: C901
+        """Called by method of res.config.settings
+        Returns True if the partner has been modified.
+        Return False if no change occured or it is only the removal of spaces
+        This method is pretty complex: the aim is to cleanup all bad data
+        that could have accumulated over the years despite the constraints
+        and remove spaces (if not done right during upgrades)
+        """
+        self.ensure_one()
+        ini_siren = self.siren
+        siren = ini_siren and "".join(x for x in ini_siren if not x.isspace()) or False
+        ini_nic = self.nic
+        nic = ini_nic and "".join(x for x in ini_nic if not x.isspace()) or False
+        ini_vat = self.vat
+        ini_siret = self.siret
+        siret = ini_siret and "".join(x for x in ini_siret if not x.isspace()) or False
+        if ini_siren in ("000000001", "000000002") or ini_vat in (
+            "FR42000000001",
+            "FR43000000002",
+        ):
+            logger.info(
+                f"Partner {self.display_name} is a SUPERPDP demo "
+                f"partner. No change."
+            )
+            return False
+        vals = {}
+        msgs = []
+        if ini_vat:
+            vat = "".join(x for x in ini_vat if not x.isspace()).upper() or False
+            if not vat:
+                vals["vat"] = False
+            else:
+                if vat_is_valid(vat):
+                    if ini_vat != vat:
+                        vals["vat"] = vat
+                        logger.info(
+                            f"Spaces removed in VAT {vat} on partner "
+                            f"{self.display_name}"
+                        )
+                else:
+                    siren_from_vat = vat[4:]
+                    if (
+                        vat.startswith("FR")
+                        and siren_is_valid(siren_from_vat)
+                        and not siren
+                    ):
+                        vals.update({"siren": siren_from_vat, "vat": False})
+                        msgs.append(
+                            self.env._(
+                                "VAT <strong>%(vat)s</strong> is not valid "
+                                "but it contains a valid SIREN "
+                                "<strong>%(siren)s</strong>. VAT has been removed "
+                                "and SIREN has been set.",
+                                vat=vat,
+                                siren=siren_from_vat,
+                            )
+                        )
+                        vat = False
+                        siren = siren_from_vat
+                    else:
+                        vals["vat"] = False
+                        msgs.append(
+                            self.env._(
+                                "VAT <strong>%s</strong> is not valid: "
+                                "it has been <strong>removed</strong>.",
+                                vat,
+                            )
+                        )
+                        vat = False
+        if ini_siren:
+            if not siren:
+                if not siret:
+                    vals.update({"siren": False, "nic": False})
+                    siren = nic = False
+            else:
+                if not siren_is_valid(siren):
+                    vals.update({"siren": False, "nic": False})
+                    msgs.append(
+                        self.env._(
+                            "SIREN <strong>%s</strong> is invalid: "
+                            "it has been removed.",
+                            siren,
+                        )
+                    )
+                    siren = nic = False
+                elif ini_vat and vat and vat_is_valid(vat):
+                    if vat.startswith("FR"):
+                        if not vat.endswith(siren):
+                            vals.update({"siren": False, "nic": False})
+                            # I decided to reset SIREN rather than VAT.
+                            # Anyway, we can't know which of the 2 information
+                            # is right. If the SIREN was right and the VAT was
+                            # wrong, the user can get the removed SIREN
+                            # in the chatter and update the partner.
+                            msgs.append(
+                                self.env._(
+                                    "SIREN <strong>%(siren)s</strong> is not "
+                                    "consistent with VAT <strong>%(vat)s</strong>: "
+                                    "<strong>SIREN has been removed</strong>.",
+                                    siren=siren,
+                                    vat=vat,
+                                )
+                            )
+                            siren = nic = False
+                    else:
+                        vals["vat"] = False
+                        msgs.append(
+                            self.env._(
+                                "The entity has a valid SIREN (%(siren)s)"
+                                "but it' VAT number (%(vat)s) "
+                                "doesn't start with 'FR', so it's VAT "
+                                "number has been removed.",
+                                siren=siren,
+                                vat=vat,
+                            )
+                        )
+                        vat = False
+
+            if siren and siren_is_valid(siren) and ini_siren != siren:
+                vals["siren"] = siren
+                logger.info(
+                    f"Spaces removed in SIREN {siren} on partner {self.display_name}"
+                )
+
+            if siren and ini_nic and "nic" not in vals:
+                ini_siret = self.siret
+                siret = (
+                    ini_siret
+                    and "".join(x for x in ini_siret if not x.isspace())
+                    or False
+                )
+                if nic:
+                    siret_from_siren_nic = siren + nic
+                    if not siret_is_valid(siret_from_siren_nic):
+                        vals["nic"] = False
+                        msgs.append(
+                            self.env._(
+                                "NIC <strong>%s</strong> has been "
+                                "<strong>removed</strong>.",
+                                self.nic,
+                            )
+                        )
+                        nic = False
+                    elif siret != siret_from_siren_nic:
+                        # This will re-build proper siret
+                        vals["nic"] = nic
+                        msgs.append(
+                            self.env._(
+                                "SIRET (%(ini_siret)s) was inconsistent with "
+                                "SIREN (%(siren)s) and NIC (%(nic)s). "
+                                "SIRET has been re-written to "
+                                "<strong>%(new_siret)s</strong>.",
+                                ini_siret=ini_siret,
+                                siren=siren,
+                                nic=nic,
+                                new_siret=siret_from_siren_nic,
+                            )
+                        )
+                    elif ini_nic != nic:
+                        vals["nic"] = nic
+                else:
+                    vals["nic"] = False
+        # now we go from siret to siren/nic
+        # but we only have to handle the case where siren and nic
+        # are not set (case when you install l10n_fr_siret after
+        # go-live and at the time where there was no post-install scripts
+        # CAUTION with siret = '792377731*****'
+        if ini_siret and "siren" not in vals and "nic" not in vals:
+            if not siret:
+                vals.update({"siren": False, "nic": False})
+            else:
+                if siret_is_valid(siret):
+                    siren_from_siret = siret[:9]
+                    nic_from_siret = siret[9:]
+                    if siren and siren != siren_from_siret:
+                        # we don't know what is the right value between siren
+                        # and siren extracted from siret, so reset both
+                        vals.update(
+                            {"siren": False, "nic": False}
+                        )  # it will update siret
+                        msgs.append(
+                            self.env._(
+                                "SIRET (%(siret)s) was inconsistent with SIREN "
+                                "(%(siren)s) and NIC (%(nic)s). "
+                                "The 3 fields have been emptied.",
+                                siret=siret,
+                                siren=siren,
+                                nic=nic,
+                            )
+                        )
+                    elif nic and nic != nic_from_siret:
+                        vals["nic"] = False
+                        msgs.append(
+                            self.env._(
+                                "SIRET (%(siret)s) was inconsistent with NIC "
+                                "(%(nic)s). NIC has been emptied and "
+                                "SIRET has been updated.",
+                                siret=siret,
+                                nic=nic,
+                            )
+                        )
+                    elif not siren and not nic:
+                        vals.update({"siren": siren_from_siret, "nic": nic_from_siret})
+                        msgs.append(
+                            self.env._(
+                                "SIREN (%(siren)s) and NIC (%(nic)s) have been "
+                                "set from SIRET (%(siret)s).",
+                                siren=siren_from_siret,
+                                nic=nic_from_siret,
+                                siret=siret,
+                            )
+                        )
+                    if (
+                        ini_siren
+                        and siren == siren_from_siret
+                        and nic == nic_from_siret
+                        and ini_siret != siret
+                    ):
+                        # just to regen siret without spaces
+                        vals.update({"siren": siren, "nic": nic})
+                        logger.info(
+                            f"Spaces removed in SIRET {ini_siret} "
+                            f"on partner {self.display_name}"
+                        )
+                else:
+                    siren_from_siret = siret[:9]
+                    if siren_from_siret and siren_is_valid(siren_from_siret):
+                        vals.update({"siren": siren_from_siret, "nic": False})
+                        msgs.append(
+                            self.env._(
+                                "Set SIREN to %(siren)s from SIRET %(siret)s.",
+                                siren=siren_from_siret,
+                                siret=siret,
+                            )
+                        )
+                    else:
+                        vals.update({"siren": False, "nic": False})
+                        msgs.append(
+                            self.env._(
+                                "SIRET %(siret)s is invalid and SIREN extracted from "
+                                "it is invalid too. SIRET has been emptied.",
+                                siret=siret,
+                            )
+                        )
+        if vals:
+            logger.info(f"Writing {vals} on partner {self.display_name} ID {self.id}")
+            self.write(vals)
+            for msg in msgs:
+                self.message_post(body=Markup(msg))
+        return bool(msgs)
+
+    def _fr_directory_should_sync_upon_confirmation(self):
+        self.ensure_one()
+        assert not self.parent_id
+        if (
+            not self.fr_directory_entity_type
+            and self.is_company
+            and self.is_france_country
+            and self._get_siren()
+        ) or self.fr_directory_entity_type == "private_inactive":
+            return True
+        return False

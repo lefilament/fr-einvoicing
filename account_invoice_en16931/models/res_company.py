@@ -9,6 +9,16 @@ from odoo.exceptions import UserError
 class ResCompany(models.Model):
     _inherit = "res.company"
 
+    en16931_default_pdf_invoice = fields.Selection(
+        [
+            ("facturx", "Factur-X"),
+            ("facturx_ubl", "Factur-X with additional UBL XML attachment"),
+            ("pdf_ubl", "PDF invoice with UBL XML attachment"),
+            ("none", "Regular PDF invoice"),
+        ],
+        default="facturx",
+        string="Default PDF Invoice Generation",
+    )
     no_vat_taxes = fields.Boolean(
         compute="_compute_no_vat_taxes", string="Company has no VAT Taxes"
     )
@@ -18,7 +28,6 @@ class ResCompany(models.Model):
         domain=[("type", "=", "tax_vatex")],
         ondelete="restrict",
     )
-    # TODO add field to choose between Factur-X and UBL
 
     def _compute_no_vat_taxes(self):
         rg_res = self.env["account.tax"]._read_group(
@@ -59,14 +68,9 @@ class ResCompany(models.Model):
                     qty_prec,
                 )
             )
-        disc_prec = dpo.precision_get("Discount")
-        if disc_prec > 2:
+        if not self.partner_id.country_id:
             errors.append(
-                self.env._(
-                    "Discount decimal precision is %s. For EN16931, the maximum "
-                    "value is 2.",
-                    disc_prec,
-                )
+                self.env._("Country is not set on company '%s'.", self.display_name)
             )
         if errors:
             raise UserError(

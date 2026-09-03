@@ -3,19 +3,65 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 import logging
+import os.path
 
 from markupsafe import Markup
 
 from odoo import api, fields, models
-from odoo.exceptions import RedirectWarning, UserError
+from odoo.exceptions import RedirectWarning, UserError, ValidationError
+from odoo.tools.misc import formatLang
 
 logger = logging.getLogger(__name__)
+# set log level of pyfrctc to log level of odoo
+pyfrctc_logger = logging.getLogger("pyfrctc")
+pyfrctc_logger.setLevel(logger.getEffectiveLevel())
 
 try:
     from pyfrctc import get_flow
 except (OSError, ImportError) as err:
     logger.debug("Cannot import pyfrctc. Error details below.")
     logger.debug(err)
+
+# Variables for invoice attachments on Chorus Pro
+CHORUS_FILENAME_MAX = 50
+CHORUS_FILESIZE_MAX_MO = 10
+CHORUS_ALLOWED_EXTENSIONS = [
+    ".BMP",
+    ".GIF",
+    ".FAX",
+    ".ODT",
+    ".PPT",
+    ".TIFF",
+    ".XLS",
+    ".BZ2",
+    ".GZ",
+    ".JPEG",
+    ".P7S",
+    ".RTF",
+    ".TXT",
+    ".XML",
+    ".CSV",
+    ".GZIP",
+    ".JPG",
+    ".PDF",
+    ".SVG",
+    ".XHTML",
+    ".XLSX",
+    ".DOC",
+    ".HTM",
+    ".ODP",
+    ".PNG",
+    ".TGZ",
+    ".XLC",
+    ".ZIP",
+    ".DOCX",
+    ".HTML",
+    ".ODS",
+    ".PPS",
+    ".TIF",
+    ".XLM",
+    ".PPTX",
+]
 
 
 class AccountMove(models.Model):
@@ -94,7 +140,8 @@ class AccountMove(models.Model):
         readonly=False,
     )
     fr_einvoicing_required = fields.Boolean(
-        compute="_compute_einvoicing_required", store=True
+        compute="_compute_einvoicing_required",
+        string="E-invoicing Required",
     )
 
     _sql_constraints = [
@@ -143,23 +190,31 @@ class AccountMove(models.Model):
         "fr_directory_company_entity_type",
         "fr_directory_partner_entity_type",
         "move_type",
-        "company_id.fr_ctc_disable_private_invoice_sending",
+        "company_id.fr_ctc_send_out_invoice",
     )
     def _compute_einvoicing_required(self):
         for move in self:
             fr_einvoicing_required = False
+            send_out_invoice = move.company_id.fr_ctc_send_out_invoice
             if (
-                move.move_type in ("out_invoice", "out_refund")
+                move.is_sale_document()
                 and move.fr_directory_company_entity_type == "private"
-                and (
-                    move.fr_directory_partner_entity_type == "public"
-                    or (
-                        move.fr_directory_partner_entity_type == "private"
-                        and not move.company_id.fr_ctc_disable_private_invoice_sending
-                    )
-                )
             ):
-                fr_einvoicing_required = True
+                if (
+                    send_out_invoice == "all"
+                    and move.fr_directory_partner_entity_type in ("public", "private")
+                ):
+                    fr_einvoicing_required = True
+                elif (
+                    send_out_invoice == "b2b"
+                    and move.fr_directory_partner_entity_type == "private"
+                ):
+                    fr_einvoicing_required = True
+                elif (
+                    send_out_invoice == "b2g"
+                    and move.fr_directory_partner_entity_type == "public"
+                ):
+                    fr_einvoicing_required = True
             move.fr_einvoicing_required = fr_einvoicing_required
 
     @api.depends("fr_directory_line_id")
@@ -189,6 +244,42 @@ class AccountMove(models.Model):
                         )[:1]
                     )
             move.company_fr_directory_line_id = company_fr_directory_line_id
+
+    @api.constrains("business_process_type", "commercial_partner_id")
+    def _check_business_process_type_b2g(self):
+        for move in self:
+            if move.is_sale_document():
+                # Rule BR-FR-CPRO-23
+                if (
+                    move.business_process_type == "fr_S3"
+                    and move.commercial_partner_id.fr_directory_entity_type != "public"
+                ):
+                    raise ValidationError(
+                        self.env._(
+                            "Business Process Type 'S3' can only be used for a "
+                            "public-sector customer (rule BR-FR-CPRO-23). On invoice "
+                            "'%(invoice)s', Business Process Type is 'S3' but the "
+                            "customer (%(partner)s) is not a public-sector customer.",
+                            invoice=move.display_name,
+                            partner=self.commercial_partner_id.display_name,
+                        )
+                    )
+                # Rule BR-FR-CPRO-24
+                if (
+                    move.business_process_type == "fr_S5"
+                    and move.commercial_partner_id.fr_directory_entity_type == "public"
+                ):
+                    raise ValidationError(
+                        self.env._(
+                            "Business Process Type 'S5' cannot be used for a "
+                            "public-sector customer (rule BR-FR-CPRO-24). On invoice "
+                            "'%(invoice)s', the customer (%(partner)s) is a "
+                            "public-sector customer but Business Process Type "
+                            "has been set to 'S5'.",
+                            invoice=move.display_name,
+                            partner=self.commercial_partner_id.display_name,
+                        )
+                    )
 
     def unlink(self):
         for move in self:
@@ -260,13 +351,16 @@ class AccountMove(models.Model):
         return action
 
     def _post(self, soft=True):
+        skip_en16931_checks_upon_post = True
         for move in self:
             company = move.company_id
             if move.is_sale_document() and company._fr_ctc_is_vat_registered(
                 raise_if_misconfigured=True
             ):
                 move._fr_ctc_sale_document_post_checks()
-                move._fr_ctc_sale_document_create_flow()
+                skip_en16931_checks_upon_post = False
+                if move.fr_einvoicing_required:
+                    move._fr_ctc_sale_document_create_flow()
             if (
                 move.is_purchase_document()
                 and move.fr_einvoicing_flow_id
@@ -276,7 +370,12 @@ class AccountMove(models.Model):
                 )
             ):
                 move._fr_ctc_create_simple_event("approved")
-        return super()._post(soft=soft)
+        return super(
+            AccountMove,
+            self.with_context(
+                skip_en16931_checks_upon_post=skip_en16931_checks_upon_post
+            ),
+        )._post(soft=soft)
 
     def _fr_ctc_sale_document_create_flow(self):
         self.ensure_one()
@@ -291,72 +390,75 @@ class AccountMove(models.Model):
                 self.id,
             )
 
-    def _fr_ctc_sale_document_post_checks(self):
+    def _fr_ctc_commercial_partner_dir_sync(self):
+        self.ensure_one()
+        cpartner = self.commercial_partner_id
+        company = self.company_id
+        dir_sync_done = False
+        try:
+            cpartner._fr_directory_sync_logs(company, self.display_name)
+            self._compute_fr_directory_line_id()
+            dir_sync_done = True
+            self.message_post(
+                body=Markup(
+                    self.env._(
+                        "Successful directory sync of the french entity "
+                        "<a href=# data-oe-model=res.partner "
+                        "data-oe-id=%(partner_id)s>%(partner_name)s</a> "
+                        "that didn't have any directory status. "
+                        "New directory status: "
+                        "<strong>%(new_entity_type)s</strong>.",
+                        partner_id=cpartner.id,
+                        partner_name=cpartner.display_name,
+                        new_entity_type=dict(
+                            cpartner._fields[
+                                "fr_directory_entity_type"
+                            ]._description_selection(self.env)
+                        ).get(cpartner.fr_directory_entity_type),
+                    )
+                )
+            )
+        except Exception as err:
+            logger.warning(
+                "Failed to update partner (triggered from customer "
+                "invoice/refund %s): %s",
+                self.display_name,
+                err,
+            )
+            self.message_post(
+                body=Markup(
+                    self.env._(
+                        "Directory sync of the french entity "
+                        "<a href=# data-oe-model=res.partner "
+                        "data-oe-id=%(partner_id)s>%(partner_name)s</a> "
+                        "that didn't have any directory status "
+                        "<strong>failed</strong>.<br/>Error: %(err)s.",
+                        partner_id=cpartner.id,
+                        partner_name=cpartner.display_name,
+                        err=str(err),
+                    )
+                )
+            )
+        return dir_sync_done
+
+    def _fr_ctc_sale_document_post_checks(self):  # noqa: C901
         self.ensure_one()
         today = fields.Date.context_today(self)
         cpartner = self.commercial_partner_id
         company = self.company_id
         dir_sync_done = False
-        if (
-            (
-                not cpartner.fr_directory_entity_type
-                or cpartner.fr_directory_entity_type == "private_inactive"
-            )
-            and cpartner.is_company
-            and cpartner.is_france_country
-            and cpartner._get_siren()
-        ):
-            try:
-                cpartner._fr_directory_sync_logs(company, self.display_name)
-                self._compute_fr_directory_line_id()
-                dir_sync_done = True
-                self.message_post(
-                    body=Markup(
-                        self.env._(
-                            "Successful directory sync of the french entity "
-                            "<a href=# data-oe-model=res.partner "
-                            "data-oe-id=%(partner_id)s>%(partner_name)s</a> "
-                            "that didn't have any directory status. "
-                            "New directory status: "
-                            "<strong>%(new_entity_type)s</strong>.",
-                            partner_id=cpartner.id,
-                            partner_name=cpartner.display_name,
-                            new_entity_type=dict(
-                                cpartner._fields[
-                                    "fr_directory_entity_type"
-                                ]._description_selection(self.env)
-                            ).get(cpartner.fr_directory_entity_type),
-                        )
-                    )
-                )
-            except Exception as err:
-                logger.warning(
-                    "Failed to update partner (triggered from customer "
-                    "invoice/refund %s): %s",
-                    self.display_name,
-                    err,
-                )
-                self.message_post(
-                    body=Markup(
-                        self.env._(
-                            "Directory sync of the french entity "
-                            "<a href=# data-oe-model=res.partner "
-                            "data-oe-id=%(partner_id)s>%(partner_name)s</a> "
-                            "that didn't have any directory status "
-                            "<strong>failed</strong>.<br/>Error: %(err)s.",
-                            partner_id=cpartner.id,
-                            partner_name=cpartner.display_name,
-                            err=str(err),
-                        )
-                    )
-                )
+        if cpartner._fr_directory_should_sync_upon_confirmation():
+            dir_sync_done = self._fr_ctc_commercial_partner_dir_sync()
         if cpartner.fr_directory_entity_type in ("public", "private"):
             if (
                 company.fr_ctc_directory_sync_on_invoice_post
                 in ("blocking", "not_blocking")
                 and not dir_sync_done
             ):
-                if cpartner.fr_directory_last_sync_date >= today:
+                if (
+                    cpartner.fr_directory_last_sync_date
+                    and cpartner.fr_directory_last_sync_date >= today
+                ):
                     self.message_post(
                         body=Markup(
                             self.env._(
@@ -469,6 +571,73 @@ class AccountMove(models.Model):
                         invoice=self.display_name,
                     )
                 )
+            # BR-FR-CPRO-30
+            for attach in self.invoice_attachment_ids:
+                self._fr_ctc_check_chorus_attachment(attach)
+
+    def _fr_ctc_check_chorus_attachment(self, attach):
+        # https://communaute.chorus-pro.gouv.fr/pieces-jointes-dans-chorus-pro-quelques-regles-a-respecter/ # noqa: B950,E501
+        self.ensure_one()
+        if len(attach.name) > CHORUS_FILENAME_MAX:
+            raise UserError(
+                self.env._(
+                    "On Chorus Pro, invoice attachment filenames "
+                    "must have %(filename_max)s caracters maximum "
+                    "(extension included). On invoice '%(invoice)s', "
+                    "attachment filename '%(filename)s' has %(filename_size)s "
+                    "caracters.",
+                    filename_max=CHORUS_FILENAME_MAX,
+                    filename=attach.name,
+                    invoice=self.display_name,
+                    filename_size=len(attach.name),
+                )
+            )
+        filename, file_extension = os.path.splitext(attach.name)
+        if not file_extension:
+            raise UserError(
+                self.env._(
+                    "On Chorus Pro, invoice attachments must have an extension. "
+                    "On invoice '%(invoice)s', attachment '%(filename)s' doesn't "
+                    "have any extension.",
+                    invoice=self.display_name,
+                    filename=attach.name,
+                )
+            )
+        if file_extension.upper() not in CHORUS_ALLOWED_EXTENSIONS:
+            raise UserError(
+                self.env._(
+                    "On Chorus Pro, the allowed file extensions for "
+                    "invoice attachments are: %(extension_list)s.\n"
+                    "On invoice '%(invoice)s', attachment '%(filename)s' "
+                    "has extension '%(extension)s' which is not part of this list.",
+                    extension_list=", ".join(CHORUS_ALLOWED_EXTENSIONS),
+                    invoice=self.display_name,
+                    filename=attach.name,
+                    extension=file_extension.upper(),
+                )
+            )
+        if not attach.file_size:
+            raise UserError(
+                self.env._(
+                    "On invoice '%(invoice)s', the size of the attachment "
+                    "'%(filename)s' is 0.",
+                    invoice=self.display_name,
+                    filename=attach.name,
+                )
+            )
+        filesize_mo = round(attach.file_size / (1024 * 1024), 1)
+        if filesize_mo >= CHORUS_FILESIZE_MAX_MO:
+            raise UserError(
+                self.env._(
+                    "On Chorus Pro, each attachment cannot exceed %(size_max)s Mb. "
+                    "On invoice '%(invoice)s', the size of attachment '%(filename)s' "
+                    "is %(size)s Mb.",
+                    size_max=CHORUS_FILESIZE_MAX_MO,
+                    invoice=self.display_name,
+                    filename=attach.name,
+                    size=formatLang(self.env, filesize_mo),
+                )
+            )
 
     def _fr_ctc_raise_error(self, err_msg, dir_sync_done):
         self.ensure_one()
@@ -488,6 +657,7 @@ class AccountMove(models.Model):
     def button_cancel(self):
         if (
             len(self) == 1
+            and self.is_purchase_document()
             and self.fr_einvoicing_flow_id
             and not self.env.context.get("by_pass_refusal_event_wizard")
             and not self.fr_einvoicing_event_ids.filtered(
@@ -506,16 +676,49 @@ class AccountMove(models.Model):
 
     def _check_draftable(self):
         for move in self:
-            if move.fr_einvoicing_flow_id and not self.env.context.get(
-                "sudo_draftable_fr_einvoicing_flow"
+            if (
+                move.is_sale_document()
+                and move.company_id._fr_ctc_is_vat_registered()
+                and not self.env.context.get("sudo_draftable_fr_einvoicing_flow")
             ):
-                raise UserError(
-                    self.env._(
-                        "You cannot reset to draft '%s' because it is linked "
-                        "to an eInvoicing flow.",
-                        move.display_name,
-                    )
-                )
+                if move.fr_einvoicing_flow_id:
+                    if move.fr_einvoicing_flow_id.state == "created":
+                        logger.info(
+                            f"Deleting flow {move.fr_einvoicing_flow_id.display_name} "
+                            f"ID {move.fr_einvoicing_flow_id.id} state created to "
+                            f"allow back to draft of invoice {move.display_name} "
+                            f"ID {move.id}"
+                        )
+                        move.message_post(
+                            body=self.env._(
+                                "Deleting the eInvoicing flow that was only in "
+                                "created state because of the reset to draft."
+                            )
+                        )
+                        move.sudo().fr_einvoicing_flow_id.unlink()
+                    else:
+                        raise UserError(
+                            self.env._(
+                                "You cannot reset to draft '%s' because it is linked "
+                                "to an eInvoicing flow that has already been "
+                                "generated.",
+                                move.display_name,
+                            )
+                        )
+                elif move.is_move_sent:
+                    cpartner = move.commercial_partner_id
+                    dir_sync_done = False
+                    if cpartner._fr_directory_should_sync_upon_confirmation():
+                        dir_sync_done = move._fr_ctc_commercial_partner_dir_sync()
+                    if move.fr_einvoicing_required:
+                        err_msg = self.env._(
+                            "You cannot reset to draft '%s' because this "
+                            "invoice has been sent to the customer but not via "
+                            "the AP and, once you will have confirmed the invoice "
+                            "again, it would have to be sent to the AP.",
+                            move.display_name,
+                        )
+                        move._fr_ctc_raise_error(err_msg, dir_sync_done)
         return super()._check_draftable()
 
     def _fr_ctc_prepare_flow(self):
@@ -527,11 +730,18 @@ class AccountMove(models.Model):
             processing_rule = "B2G"
         else:
             processing_rule = "OutOfScope"
-        syntax = "Factur-X"  # CII / UBL
-        # TODO syntax will be a config parameter one day
+        odoo_invoice_format = self.company_id.fr_ctc_send_invoice_format or "facturx"
+        odoo_invoice_format2SYNTAX = {
+            "facturx": "Factur-X",
+            "ubl_pdf": "UBL",
+            "ubl": "UBL",
+            "cii_pdf": "CII",
+            "cii": "CII",
+        }
         vals = {
             "direction": "out",
-            "syntax": syntax,
+            "syntax": odoo_invoice_format2SYNTAX[odoo_invoice_format],
+            "odoo_invoice_format": odoo_invoice_format,
             "processing_rule": processing_rule,
             "type": "CustomerInvoice",
             "company_id": self.company_id.id,
@@ -540,19 +750,24 @@ class AccountMove(models.Model):
 
     def fr_ctc_send_invoice_immediately_button(self):
         self.ensure_one()
-        assert self.fr_directory_company_entity_type == "private"
-        assert self.fr_directory_partner_entity_type in ("private", "public")
+        assert self.fr_einvoicing_required
         assert self.state == "posted"
         flow = self.fr_einvoicing_flow_id
         assert flow
         assert flow.state in ("created", "generated")
-        # TODO add logs ?
-        result = {"logs": []}
+        result = {
+            "log_type": "flow_generate_and_send",
+            "log_origin": "Send button from invoice",
+            "company_id": self.company_id.id,
+            "logs": [],
+            "updated_count": 0,
+        }
         if flow.state == "created":
             flow._generate(result)
         if flow.state == "generated":
             session = self.company_id._fr_ctc_get_session()
             flow._send(session, result)
+        self.env["fr.einvoicing.log"]._create_log(result)
 
         # write is_move_sent=True is made by the _send() method
 

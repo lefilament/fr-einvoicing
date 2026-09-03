@@ -96,9 +96,17 @@
                                 decoration-warning="direction == 'out'"
                             />
                             <field name="event_id" invisible="not event_id" />
+                            <field
+                                name="auto_internal_move_id"
+                                invisible="not auto_internal_move_id"
+                            />
                             <field name="move_id" invisible="not move_id" />
                             <field name="type" />
                             <field name="syntax" />
+                            <field
+                                name="odoo_invoice_format"
+                                invisible="direction != 'out' or syntax not in ('UBL', 'CII', 'Factur-X')"
+                            />
                             <field name="profile" />
                             <field name="processing_rule" />
                             <field
@@ -209,7 +217,7 @@
                 <field
                     name="identifier"
                     string="Identifier or Invoice"
-                    filter_domain="['|', ('identifier', 'ilike', self), ('move_list', 'ilike', self)]"
+                    filter_domain="['|', '|', ('identifier', 'ilike', self), ('move_id', 'ilike', self), ('auto_internal_move_id', '=', self)]"
                 />
                 <separator />
                 <filter
@@ -317,6 +325,7 @@
     <record id="fr_einvoicing_flow_action" model="ir.actions.act_window">
         <field name="name">eInvoicing Flows</field>
         <field name="res_model">fr.einvoicing.flow</field>
+        <field name="path">fr-einvoicing-flow</field>
         <field name="view_mode">list,graph,pivot,form</field>
     </record>
 

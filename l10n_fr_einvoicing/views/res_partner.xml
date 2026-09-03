@@ -12,7 +12,7 @@
             <group name="misc" position="after">
                 <group
                     name="fr_einvoicing"
-                    string="e-Invoicing for France"
+                    string="eInvoicing for France"
                     invisible="parent_id or not is_france_country"
                 >
                     <field
@@ -69,10 +69,14 @@
                 </group>
                 <group
                     name="fr_einvoicing_child"
-                    string="e-Invoicing for France"
+                    string="eInvoicing for France"
                     invisible="not parent_id or not is_france_country"
                 >
-                    <p>Managed on <button
+                    <field
+                        name="default_fr_directory_line_id"
+                        invisible="not fr_directory_line_show"
+                    />
+                    <p>Other parameters are managed on <button
                         name="open_commercial_entity"
                         type="object"
                         string="the parent company"
@@ -99,7 +103,7 @@
             <div name="warning_company" position="after">
                 <div
                     name="fr_directory_closed"
-                    invisible="not fr_directory_closed and not (parent_id and parent_id.fr_directory_closed)"
+                    invisible="not fr_directory_show_warning_closed"
                     class="alert alert-warning"
                     role="alert"
                 >According to the directory, this entity is <strong>closed</strong>.
