@@ -660,7 +660,7 @@ class FrEreporting(models.Model):
         mline_obj = self.env["account.move.line"]
         # 1. get move lines in bank account linked to default_account_id
         default_accounts = self.env["account.account"]
-        # I don't put 'credit' because it is not for
+        # I don't put journal with type='credit' because it is not for
         # receiving money from the outside TODO confirm
         journals = self.env["account.journal"].search(
             [
@@ -760,6 +760,7 @@ class FrEreporting(models.Model):
                 "passthrough_journal_ids": passthrough_journal_ids,
                 "sale_journal_ids": sale_journal_ids,
                 "france_vat_tax_id2rate": vat_tax_id2rate,
+                "company_no_vat_taxes": self.company_id.no_vat_taxes,
             }
         )
 
@@ -772,8 +773,9 @@ class FrEreporting(models.Model):
             wdict[bank_mline.id] = {
                 "date": date,
                 "payments": {},
-                # key = receivable move line ; value: cf _get_related_receivable_lines()
-                "parsed_moves": [],
+                # payments: key = receivable move line
+                #           value: cf _get_related_receivable_lines()
+                "parsed_moves": [],  # used to avoid loop
                 "ini_notes": [],
             }
             pdict = wdict[bank_mline.id]
@@ -781,7 +783,7 @@ class FrEreporting(models.Model):
             first_move, *propag_moves = pdict["parsed_moves"]
             first_move_path = f"{speedy['move_path_prefix']}/{first_move.id}"
             pdict["ini_notes"].append(
-                f"""Bank/Cash entry point: """
+                f"""<strong>Bank/cash entry point:</strong> """
                 f"""<a href="{first_move_path}">{first_move.display_name}</a> """
                 f"dated {format_date(self.env, first_move.date)} (→ Payment Date)"
             )
@@ -820,16 +822,14 @@ class FrEreporting(models.Model):
             ):
                 continue
             if counterpart_mline.account_id.id in speedy["receivable_account_ids"]:
-                #                sign = counterpart_mline.balance < 0 and -1 or 1
                 pdict["payments"][counterpart_mline] = {
-                    #                    'sign': sign,
                     "amount": counterpart_mline.balance * -1,
                     "split_by_sale": {},  # key = sale move ; value = weight
                     "partner_id": counterpart_mline.partner_id.id or False,
                     "partner_name": counterpart_mline.partner_id
                     and counterpart_mline.partner_id.display_name
                     or False,
-                    "reconcile_type": None,
+                    "reconcile_type": None,  # will be set by _payment_split_by_sale()
                 }
             elif (
                 counterpart_mline.account_id.id in speedy["passthrough_account_ids"]
@@ -946,6 +946,7 @@ class FrEreporting(models.Model):
 
         for _bank_mline_id, pdict in wdict.items():
             date = pdict["date"]
+            ini_notes_added = set()  # set of sale move ID or False
             for pay_mline, rdict in pdict["payments"].items():
                 total_amount = rdict["amount"]
                 total_prorata_amount = 0.0
@@ -982,8 +983,8 @@ class FrEreporting(models.Model):
                 else:
                     partner_note = "(no partner)"
                 pay_mline_note = (
-                    f"Payment Journal Item: {pay_mline_url} dated "
-                    f"{format_date(self.env, pay_mline.date)} amount "
+                    f"<strong><em>Payment Journal Item:</em></strong> {pay_mline_url} "
+                    f"dated {format_date(self.env, pay_mline.date)} amount "
                     f"{format_amount(self.env, total_amount, speedy['currency'])} "
                     f"{partner_note}"
                 )
@@ -1000,7 +1001,10 @@ class FrEreporting(models.Model):
                     sale_note = prepare_sale_note(
                         sale_move, weight, sale_move2rate, rdict, speedy
                     )
-                    notes = pdict["ini_notes"] + [pay_mline_note, sale_note]
+                    notes = [pay_mline_note, sale_note]
+                    if move_id not in ini_notes_added:
+                        notes = pdict["ini_notes"] + notes
+                        ini_notes_added.add(move_id)
                     aggregate_payment(agg, date, move_id, notes, rate2amount)
                 # process last sale
                 pay_amount = total_amount - total_prorata_amount
@@ -1010,7 +1014,10 @@ class FrEreporting(models.Model):
                 sale_note = prepare_sale_note(
                     last_sale_move, last_weight, sale_move2rate, rdict, speedy
                 )
-                notes = pdict["ini_notes"] + [pay_mline_note, sale_note]
+                notes = [pay_mline_note, sale_note]
+                if move_id not in ini_notes_added:
+                    notes = pdict["ini_notes"] + notes
+                    ini_notes_added.add(move_id)
                 aggregate_payment(agg, date, move_id, notes, rate2amount)
         return agg, warning_list
 
@@ -1443,7 +1450,7 @@ class FrEreportingTransactionRate(models.Model):
 class FrEreportingPayment(models.Model):
     _name = "fr.ereporting.payment"
     _description = "Payment for eReporting for France"
-    _order = "fr_ereporting_id, date desc"
+    _order = "fr_ereporting_id, date desc, move_id"
 
     fr_ereporting_id = fields.Many2one(
         "fr.ereporting", ondelete="cascade", index=True, required=True, readonly=True

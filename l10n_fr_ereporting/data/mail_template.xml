@@ -29,6 +29,7 @@
                         t-out="dict(object.fields_get('fr_vat_periodicity', 'selection')['fr_vat_periodicity']['selection'])[object.fr_vat_periodicity]"
                     />
                 </strong>.</p>
+                <p />
                 <table
                     style="border-spacing: 0; border-collapse: collapse; width: 100%; text-align: center;"
                 >
@@ -72,6 +73,7 @@
                         </tr>
                     </t>
                 </table>
+                <p />
                 <p
                     style="margin: 0px; padding: 0px; font-size: 10px; font-family: 'Courier New', Courier, Prestige, monospace"
                 >

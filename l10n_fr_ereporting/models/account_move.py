@@ -61,13 +61,13 @@ class AccountMove(models.Model):
 
     def _fr_ctc_split_by_vat_rate(self, rate_dict, speedy):
         # TODO when there is no taxes (auto-entrep)
+        # in fact, when there is no tax, there is no ventilation needed,
+        # so we don't need this method
         self.ensure_one()
-        vat_tax_id2rate = speedy["france_vat_tax_id2rate"]
-        account2rate = speedy["france_due_vat_account2rate"]
-        assert self.journal_id
         if self.move_type in ("out_invoice", "out_refund"):
             # the module account_invoice_en16931 ensures that
             # there is exactly 1 VAT tax per invoice line
+            vat_tax_id2rate = speedy["france_vat_tax_id2rate"]
             for iline in self.invoice_line_ids:
                 if iline.display_type == "product":
                     for tax in iline.tax_ids:
@@ -86,6 +86,7 @@ class AccountMove(models.Model):
                             ]
                             break
         else:
+            account2rate = speedy["france_due_vat_account2rate"]
             for line in self.line_ids:
                 if line.account_id in account2rate:
                     rate_int = account2rate[line.account_id]
