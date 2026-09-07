@@ -13,7 +13,7 @@ class AccountMove(models.Model):
         if chorus_invoice_format == "pdf_factur-x":
             chorus_file_content = self.with_context(
                 chorus_old_xml_syntax=True
-            )._get_en16931_invoice_bin("facturx")
+            )._get_en16931_invoice_bin("facturx")[0]
         else:
             chorus_file_content = super()._chorus_get_invoice(chorus_invoice_format)
         return chorus_file_content

@@ -53,9 +53,16 @@
                         name="back2created_button"
                         type="object"
                         string="Back to Created"
-                        invisible="state != 'error'"
+                        invisible="state not in ('error', 'cancel')"
                         groups="account.group_account_invoice"
                         confirm="Are you sure you want to go back to Created?"
+                    />
+                    <button
+                        name="%(fr_einvoicing_flow_cancel_action)d"
+                        type="action"
+                        string="Cancel"
+                        invisible="state != 'error'"
+                        groups="account.group_account_manager"
                     />
                     <field
                         name="state"
@@ -135,6 +142,10 @@
                                 name="odoo_error_details"
                                 invisible="not odoo_error_details"
                             />
+                            <field
+                                name="cancel_comment"
+                                invisible="state != 'cancel'"
+                            />
                         </group>
                     </group>
                     <group
@@ -151,7 +162,22 @@
                     >
                         <field name="event_ids" nolabel="1" colspan="2" />
                     </group>
+                    <group
+                        name="data_dict"
+                        string="Data Map for debug"
+                        groups="base.group_no_one"
+                        invisible="not data_dict"
+                    >
+                        <field
+                            name="data_dict_txt"
+                            nolabel="1"
+                            colspan="2"
+                            widget="code"
+                            options="{'mode': 'python'}"
+                        />
+                    </group>
                 </sheet>
+                <chatter />
             </form>
         </field>
     </record>

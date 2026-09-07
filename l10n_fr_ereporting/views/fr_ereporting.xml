@@ -215,7 +215,7 @@
                     </group>
                     <group name="main-right">
                         <field name="category" />
-                        <field name="currency_id" invisible="1" />
+                        <field name="currency_id" />
                         <field name="company_currency_id" invisible="1" />
                         <field name="vat_exigibility" />
                     </group>
@@ -237,10 +237,10 @@
                 />
                 <field name="date" />
                 <field name="category" />
+                <field name="currency_id" />
+                <field name="vat_exigibility" optional="show" />
                 <field name="base_amount" />
                 <field name="vat_amount" sum="1" />
-                <field name="vat_exigibility" optional="show" />
-                <field name="currency_id" column_invisible="1" />
                 <field name="company_currency_id" column_invisible="1" />
             </list>
         </field>

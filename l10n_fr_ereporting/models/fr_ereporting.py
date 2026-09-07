@@ -579,6 +579,8 @@ class FrEreporting(models.Model):
         company_cur = company.currency_id
         move_domain = [
             ("company_id", "=", company.id),
+            # We could have used invoice_date... but we decided to use "date"
+            # both here and in XML
             ("date", ">=", self.start_date),
             ("date", "<=", self.end_date),
             ("state", "=", "posted"),
@@ -1100,7 +1102,7 @@ class FrEreporting(models.Model):
             logger.debug("data_dict used to generate payment FRR XML:")
             logger.info(pformat(data_dict))
             xml_bytes = generate_ereporting_payments(data_dict, check_xsd=True)
-        flow_vals = self._prepare_flow_vals(identifier, xml_bytes)
+        flow_vals = self._prepare_flow_vals(identifier, data_dict, xml_bytes)
         flow = self.env["fr.einvoicing.flow"].sudo().create(flow_vals)
         self.write({"state": "sent", "flow_id": flow.id, "identifier": identifier})
         if self.company_id.fr_ctc_ereporting_update_lock_dates:
@@ -1218,6 +1220,7 @@ class FrEreporting(models.Model):
                     )
                 )
             inv_dict = move._prepare_en16931_dict(speedy)
+            inv_dict["BT-2"] = move.date  # instead of invoice_date
             if self.type == "in_transaction":
                 # BT-47 and BT-47-1 must be OK because it has the company SIREN
                 if move.fiscal_position_fr_vat_type == "intracom_b2b":
@@ -1320,7 +1323,7 @@ class FrEreporting(models.Model):
                 )
         return data_dict
 
-    def _prepare_flow_vals(self, identifier, xml_bytes):
+    def _prepare_flow_vals(self, identifier, data_dict, xml_bytes):
         self.ensure_one()
         if self.type == "out_transaction":
             flow_type = "MultiFlowReport"
@@ -1337,6 +1340,7 @@ class FrEreporting(models.Model):
             "file_bin": base64.encodebytes(xml_bytes),
             "filename": f"{identifier}.xml",
             "state": "generated",
+            "data_dict": data_dict,
         }
         return vals
 
@@ -1390,7 +1394,9 @@ class FrEreportingTransaction(models.Model):
         required=True,
         readonly=True,
     )
-    currency_id = fields.Many2one("res.currency", string="Transaction Currency")
+    currency_id = fields.Many2one(
+        "res.currency", string="Transaction Currency", readonly=True
+    )
     company_currency_id = fields.Many2one(
         related="fr_ereporting_id.company_id.currency_id", string="Company Currency"
     )
@@ -1402,7 +1408,7 @@ class FrEreportingTransaction(models.Model):
         string="VAT Exigibility",
         readonly=True,
     )
-    base_amount = fields.Monetary(currency_field="currency_id", readonly=True)
+    base_amount = fields.Monetary(currency_field="company_currency_id", readonly=True)
     vat_amount = fields.Monetary(
         currency_field="company_currency_id", string="VAT Amount", readonly=True
     )
@@ -1432,7 +1438,7 @@ class FrEreportingTransactionRate(models.Model):
         related="fr_ereporting_transaction_id.vat_exigibility"
     )
     vat_rate = fields.Float(string="VAT Rate", digits=(3, 2), readonly=True)
-    base_amount = fields.Monetary(currency_field="currency_id", readonly=True)
+    base_amount = fields.Monetary(currency_field="company_currency_id", readonly=True)
     vat_amount = fields.Monetary(
         string="VAT Amount", currency_field="company_currency_id", readonly=True
     )
