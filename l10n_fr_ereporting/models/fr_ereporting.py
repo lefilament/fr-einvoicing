@@ -1196,6 +1196,20 @@ class FrEreporting(models.Model):
         )
         for move in self.move_ids:
             speedy = move._prepare_en16931_speedy()
+            # this has already been checked by the inherit of _post()
+            # but the info may have been removed in the meantime
+            if move.fiscal_position_fr_vat_type == "intracom_b2b" and (
+                not move.commercial_partner_id.vat
+                or move.commercial_partner_id.vat == "/"
+            ):
+                raise UserError(
+                    self.env._(
+                        "VAT Number is not set on partner '%(partner)s' "
+                        "(invoice %(invoice)s).",
+                        partner=move.commercial_partner_id.display_name,
+                        invoice=move.display_name,
+                    )
+                )
             inv_dict = move._prepare_en16931_dict(speedy)
             if self.type == "in_transaction":
                 # BT-47 and BT-47-1 must be OK because it has the company SIREN

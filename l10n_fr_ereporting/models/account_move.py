@@ -30,8 +30,7 @@ class AccountMove(models.Model):
         for move in self:
             if (
                 move.is_invoice()
-                and move.fiscal_position_id
-                and move.fiscal_position_id.fr_vat_type == "intracom_b2b"
+                and move.fiscal_position_fr_vat_type == "intracom_b2b"
                 and (
                     not move.commercial_partner_id.vat
                     or move.commercial_partner_id.vat == "/"
