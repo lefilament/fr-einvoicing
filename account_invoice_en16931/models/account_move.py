@@ -5,11 +5,13 @@
 
 import base64
 import logging
+from datetime import timezone
 from io import BytesIO
 from pprint import pformat
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
-import pytz
+from lxml import etree
 from pypdf import PdfWriter
 from pypdf.generic import NameObject
 
@@ -24,14 +26,17 @@ facturx_logger = logging.getLogger("factur-x")
 facturx_logger.setLevel(logger.getEffectiveLevel())
 
 try:
-    from facturx import generate_from_file, generate_xml
+    from facturx import (
+        generate_from_file,
+        generate_xml,
+        generate_xmp_object,
+        untdid4461_to_text_code,
+    )
 except (OSError, ImportError) as err:
     logger.debug("Cannot import facturx. Error details below.")
     logger.debug(err)
 
 
-DIRECT_DEBIT_CODES = ("49", "59")
-CREDIT_TRF_CODES = ("30", "31", "42")
 INVOICE_TYPE_CODES = (
     "380",
     "389",
@@ -380,21 +385,22 @@ class AccountMove(models.Model):
         else:
             return None
 
-    def _prepare_bt34_with_scheme(self, speedy):
+    def _en16931_prepare_partner_data(self, speedy):
         self.ensure_one()
-        if (
-            hasattr(self, "company_fr_directory_line_id")
-            and self.company_fr_directory_line_id
-        ):
-            return (self.company_fr_directory_line_id.identifier, "0225")
-        return (False, False)
+        return self.partner_id._en16931_partner_data(speedy)
 
-    def _prepare_bt49_with_scheme(self, speedy):
+    def _en16931_prepare_company_data(self, speedy):
         self.ensure_one()
-        # module l10n_fr_einvoicing
-        if hasattr(self, "fr_directory_line_id") and self.fr_directory_line_id:
-            return (self.fr_directory_line_id.identifier, "0225")
-        return (False, False)
+        company_vals = self.company_id.partner_id._en16931_partner_data(speedy)
+        if self.user_id:
+            phone = self.user_id.partner_id.mobile or self.user_id.partner_id.phone
+            contact_vals = {
+                "name": self.user_id.name,
+                "phone": phone,
+                "email": self.user_id.partner_id.email,
+            }
+            company_vals["contacts"] = [contact_vals]
+        return company_vals
 
     def _prepare_bt72(self, speedy):
         self.ensure_one()
@@ -410,13 +416,13 @@ class AccountMove(models.Model):
                     ]
                     if delivery_datetimes:
                         delivery_datetime_naive_utc = max(delivery_datetimes)
-                        delivery_datetime_aware_utc = pytz.utc.localize(
-                            delivery_datetime_naive_utc
+                        delivery_datetime_aware_utc = (
+                            delivery_datetime_naive_utc.replace(tzinfo=timezone.utc)
                         )
                         user_tz = (
                             self.env.user.tz
-                            and pytz.timezone(self.env.user.tz)
-                            or pytz.utc
+                            and ZoneInfo(self.env.user.tz)
+                            or timezone.utc
                         )
                         delivery_datetime_aware_usertz = (
                             delivery_datetime_aware_utc.astimezone(user_tz)
@@ -448,12 +454,8 @@ class AccountMove(models.Model):
             bg23.append(
                 {
                     "BT-118": vat_dict["categ_code"],
-                    "BT-117-1": self.currency_id.name,  # for UBL
-                    "BT-116-1": self.currency_id.name,  # for UBL
-                    "BT-116": self.currency_id._en16931_format(
-                        self.amount_total
-                    ),  # base
-                    "BT-117": self.currency_id._en16931_format(0),  # amount
+                    "BT-116": self.amount_total,  # base
+                    "BT-117": 0,  # amount
                     "BT-121": vat_dict["vatex_code"],
                     "BT-120": vat_dict["vatex_label"],
                 }
@@ -489,16 +491,10 @@ class AccountMove(models.Model):
                 bt111 += tax_vals.get("target_tax_amount", 0)
                 bg23.append(
                     {
-                        "BT-116": self.currency_id._en16931_format(
-                            tax_vals.get("target_base_amount_currency", 0)
-                        ),
-                        "BT-116-1": self.currency_id.name,
-                        "BT-117": self.currency_id._en16931_format(
-                            tax_vals.get("target_tax_amount_currency", 0)
-                        ),
-                        "BT-117-1": self.currency_id.name,
+                        "BT-116": tax_vals.get("target_base_amount_currency", 0),
+                        "BT-117": tax_vals.get("target_tax_amount_currency", 0),
                         "BT-118": tax_dict["unece_categ_code"],
-                        "BT-119": "%.2f" % (tax_dict["rate_int"] / 1000),  # rate
+                        "BT-119": tax_dict["rate_int"] / 1000,
                         "BT-120": tax_dict["vatex_label"],
                         "BT-121": tax_dict["vatex_code"],
                     }
@@ -516,6 +512,34 @@ class AccountMove(models.Model):
                     "BT-26": self.reversed_entry_id.invoice_date,
                 }
             )
+        elif (
+            self.move_type == "out_refund"
+            and speedy["sale_installed"]
+            and self.invoice_line_ids.sale_line_ids
+            and self.invoice_line_ids.sale_line_ids.invoice_lines.move_id.filtered(
+                lambda x: x.move_type == "out_invoice" and x.state == "posted"
+            )
+        ):
+            related_invoice = (
+                self.invoice_line_ids.sale_line_ids.invoice_lines.move_id.filtered(
+                    lambda x: x.move_type == "out_invoice" and x.state == "posted"
+                )[0]
+            )
+            res.append(
+                {
+                    "BT-25": related_invoice.name,
+                    "EXT-FR-FE-02": related_invoice.invoice_type_code,
+                    "BT-26": related_invoice.invoice_date,
+                }
+            )
+        elif self.move_type in ("out_refund", "in_refund"):
+            # BG-3 is required for refunds (stupid rules G1.31 + G1.32)
+            res.append(
+                {
+                    "BT-25": "UNKNOWN",
+                    "BT-26": self.invoice_date or fields.Date.context_today(self),
+                }
+            )
         return res
 
     def _prepare_bg24(self, speedy, pdf_invoice_bin):
@@ -531,7 +555,7 @@ class AccountMove(models.Model):
                     and self.name
                     or self.env._("Draft Invoice"),
                     "BT-123": "LISIBLE",
-                    "BT-125": base64.encodebytes(pdf_invoice_bin),
+                    "BT-125": pdf_invoice_bin,
                     "BT-125-1": "application/pdf",
                     "BT-125-2": filename,
                 }
@@ -541,7 +565,7 @@ class AccountMove(models.Model):
                 bg24.append(
                     {
                         "BT-122": attach.name,
-                        "BT-125": attach.datas,
+                        "BT-125": attach.raw,
                         "BT-125-1": attach.mimetype,
                         "BT-125-2": attach.name,
                         # for Factur-X
@@ -560,9 +584,12 @@ class AccountMove(models.Model):
             and payment_method_line.payment_method_id.unece_code
             or False
         )
+        if payment_unece_code:
+            vals["BT-81"] = payment_unece_code
+        payment_text_code = untdid4461_to_text_code(payment_unece_code)
         # in the schematron, they want to back account even on refunds,
         # so we don't filter the IF below on "out_invoice"
-        if payment_unece_code in CREDIT_TRF_CODES:
+        if payment_text_code == "credit_transfer":
             if hasattr(payment_method_line, "bank_account_link"):
                 # if account_payment_base_oca is installed
                 bank_account = (
@@ -573,16 +600,14 @@ class AccountMove(models.Model):
             else:
                 bank_account = payment_method_line.journal_id.bank_account_id
             if bank_account:
-                vals["BT-81"] = payment_unece_code
                 vals["BT-84"] = bank_account.sanitized_acc_number
                 vals["BT-86"] = bank_account.bank_bic
         elif (
-            payment_unece_code in DIRECT_DEBIT_CODES
+            payment_text_code == "direct_debit"
             and hasattr(self, "mandate_id")
             and self.mandate_id.partner_bank_id
             and self.move_type == "out_invoice"
         ):
-            vals["BT-81"] = payment_unece_code
             vals["BT-83"] = (
                 self.payment_reference or self.name or speedy["state2label"][self.state]
             )
@@ -641,11 +666,6 @@ class AccountMove(models.Model):
             "price_prec": price_prec,
             "disc_prec": disc_prec,
             "qty_prec": qty_prec,
-            "price_fmt": f"%.{price_prec}f",
-            "disc_fmt": f"%.{disc_prec}f",
-            "qty_fmt": f"%.{qty_prec}f",
-            "tax_rate_fmt": "%.2f",
-            "tax_amount_prec": 4,  # precision of the 'amount' field of account.tax
             "lang": lang,
             "company_no_vat_taxes": self.company_id.no_vat_taxes,
             "vat_info4company_no_vat_taxes": {
@@ -707,86 +727,39 @@ class AccountMove(models.Model):
         vals["BT-20"] = self._prepare_bt20(speedy)
         vals["BT-23"] = self._prepare_bt23(speedy)
         # BT-24 is set by the factur-x lib
-        # SELLER
-        vals["BT-34"], vals["BT-34-1"] = self._prepare_bt34_with_scheme(speedy)
         if not self.partner_id:
             raise UserError(self.env._("Customer is not selected yet."))
+        partner_vals = self._en16931_prepare_partner_data(speedy)
+        company_vals = self._en16931_prepare_company_data(speedy)
         if self.is_purchase_document():
-            buyer_partner = self.company_id.partner_id
-            seller_partner = self.partner_id
+            vals["BG-4"] = partner_vals
+            vals["BG-7"] = company_vals
         else:
-            seller_partner = self.company_id.partner_id
-            buyer_partner = self.partner_id
-        buyer_partner_data = buyer_partner._en16931_partner_data()
-        seller_partner_data = seller_partner._en16931_partner_data()
-        if self.user_id:
-            vals["BT-41"] = self.user_id.name
-            phone = self.user_id.partner_id.mobile or self.user_id.partner_id.phone
-            if phone:
-                vals["BT-42"] = phone
-            vals["BT-43"] = self.user_id.partner_id.email
-        vals["BT-27"] = seller_partner_data["name"]
-        vals["BT-29"] = {}  # populated by country-specific modules
-        vals["BT-35"] = seller_partner_data["street"]
-        vals["BT-36"] = seller_partner_data["street2"]
-        vals["BT-162"] = seller_partner_data.get("street3")
-        vals["BT-38"] = seller_partner_data["zip"]
-        vals["BT-37"] = seller_partner_data["city"]
-        vals["BT-39"] = seller_partner_data.get("state_name")
-        vals["BT-40"] = seller_partner_data["country_code"]
-        vals["BT-31"] = seller_partner_data["vat"]
-        # BUYER
-        vals["BT-49"], vals["BT-49-1"] = self._prepare_bt49_with_scheme(speedy)
-        vals["BT-46"] = {}  # populated by country-specific modules
-        vals["BT-44"] = buyer_partner_data["name"]
-        vals["BT-56"] = buyer_partner_data.get("contact_name")
-        vals["BT-57"] = buyer_partner_data["phone"]
-        vals["BT-58"] = buyer_partner_data["email"]
-        vals["BT-50"] = buyer_partner_data["street"]
-        vals["BT-51"] = buyer_partner_data["street2"]
-        vals["BT-163"] = buyer_partner_data.get("street3")
-        vals["BT-53"] = buyer_partner_data["zip"]
-        vals["BT-52"] = buyer_partner_data["city"]
-        vals["BT-54"] = buyer_partner_data.get("state_name")
-        vals["BT-55"] = buyer_partner_data["country_code"]
-        vals["BT-48"] = buyer_partner_data["vat"]
+            vals["BG-4"] = company_vals
+            vals["BG-7"] = partner_vals
         if self.invoice_incoterm_id:
             vals["EXT-FR-FE-185"] = self.invoice_incoterm_id.code
             if self.incoterm_location:
                 vals["EXT-FR-FE-186"] = self.incoterm_location
         if self.partner_shipping_id:
-            ship_partner_data = self.partner_shipping_id._en16931_partner_data()
-            vals["BT-70"] = ship_partner_data["name"]
-            vals["BT-75"] = ship_partner_data["street"]
-            vals["BT-76"] = ship_partner_data["street2"]
-            vals["BT-77"] = ship_partner_data["city"]
-            vals["BT-78"] = ship_partner_data["zip"]
-            vals["BT-165"] = ship_partner_data.get("street3")
-            vals["BT-79"] = ship_partner_data.get("state_name")
-            vals["BT-80"] = ship_partner_data["country_code"]
+            vals["BG-13"] = self.partner_shipping_id._en16931_partner_data(speedy)
         vals["BT-72"] = self._prepare_bt72(speedy)
         vals.update(self._prepare_en16931_payment_data(speedy))
         bg25, bg20, totals, base_lines = self._prepare_en16931_invoice_lines(speedy)
         for allowance_total_field in ("BT-107", "BT-108"):
             allowance_total = totals[allowance_total_field]
             if not self.currency_id.is_zero(allowance_total):
-                vals[allowance_total_field] = self.currency_id._en16931_format(
-                    allowance_total
-                )
-        vals["BT-106"] = self.currency_id._en16931_format(totals["BT-106"])
+                vals[allowance_total_field] = allowance_total
+        vals["BT-106"] = totals["BT-106"]
         bt109 = totals["BT-106"] - totals["BT-107"] + totals["BT-108"]
         bg23, bt110, bt111 = self._prepare_bg23(base_lines, speedy)
-        vals["BT-109"] = self.currency_id._en16931_format(bt109)
-        vals["BT-110"] = self.currency_id._en16931_format(bt110)
-        vals["BT-110-1"] = self.currency_id.name
+        vals["BT-109"] = bt109
+        vals["BT-110"] = bt110
         if vals.get("BT-6"):
-            vals["BT-111"] = self.currency_id._en16931_format(bt111)
-            vals["BT-111-1"] = vals["BT-6"]
-        vals["BT-112"] = self.currency_id._en16931_format(self.amount_total)
-        vals["BT-113"] = self.currency_id._en16931_format(
-            self.amount_total - self.amount_residual
-        )
-        vals["BT-115"] = self.currency_id._en16931_format(self.amount_residual)
+            vals["BT-111"] = bt111
+        vals["BT-112"] = self.amount_total
+        vals["BT-113"] = self.amount_total - self.amount_residual
+        vals["BT-115"] = self.amount_residual
         vals["BG-23"] = bg23
         vals["BG-1"] = self._prepare_bg1(speedy)
         vals["BG-25"] = bg25  # invoice lines with price >= 0
@@ -829,7 +802,7 @@ class AccountMove(models.Model):
         if invoice_format.startswith("facturx"):
             for attach in data_dict.get("BG-24", []):
                 if attach.get("BT-125") and attach.get("BT-125-2"):
-                    vals = {"filedata": base64.decodebytes(attach["BT-125"])}
+                    vals = {"filedata": attach["BT-125"]}
                     if attach.get("modification_datetime"):
                         vals["modification_datetime"] = attach["modification_datetime"]
                     if attach.get("creation_datetime"):
@@ -1039,6 +1012,50 @@ class AccountMove(models.Model):
         if b64:
             invoice_bin = base64.encodebytes(invoice_bin)
         return invoice_bin, data_dict
+
+    def _qweb_pdfa_prepare_metadata(self):
+        self.ensure_one()
+        metadata = {
+            "title": self.display_name,
+            "author": self.company_id.name,
+            "subject": self.move_type == "out_refund"
+            and self.env._("Credit Note")
+            or self.env._("Invoice"),
+            "keywords": self.env._("Invoice"),
+            # producer and creator_tool are later re-written to "Odoo"
+            # so it's not useful to set it to from odoo_pdf_reader.metadata
+            "producer": "Odoo",
+            "creator_tool": "Odoo",
+            "timestamp_dt": fields.Datetime.now(),
+        }
+        return metadata
+
+    def _qweb_pdfa_generate_xmp_bytes(self, metadata_dict):
+        self.ensure_one()
+        xmp_date_str = metadata_dict["timestamp_dt"].strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        metadata_dict.update(
+            {
+                "pdfa3_flavor": "A",
+                "timestamp": xmp_date_str,
+            }
+        )
+        xml_root = generate_xmp_object(metadata_dict)
+        xml_bytes = etree.tostring(xml_root, pretty_print=True, encoding="UTF-8")
+        return xml_bytes
+
+    def _qweb_pdfa_generate_txt_metadata(self, metadata_dict, odoo_writer):
+        timestamp_str = metadata_dict["timestamp_dt"].strftime("D:%Y%m%d%H%M%S+00'00'")
+        txt_metadata = {
+            "/Author": metadata_dict["author"],
+            "/Title": metadata_dict["title"],
+            "/Subject": metadata_dict["subject"],
+            "/Keywords": metadata_dict["keywords"],
+            "/Producer": metadata_dict["producer"],
+            "/Creator": metadata_dict["creator_tool"],
+            "/CreationDate": timestamp_str,
+            "/ModDate": timestamp_str,
+        }
+        odoo_writer.add_metadata(txt_metadata)
 
     @api.model
     def _get_specific_saxon_server_url(self):

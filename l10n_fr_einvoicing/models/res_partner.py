@@ -506,6 +506,9 @@ class ResPartner(models.Model):
         if vals["fr_directory_entity_type"] == "no":
             msg = f"Partner {self.display_name} SIREN {siren} is not in the directory."
             log_obj._info_log(result, msg)
+            self.fr_directory_line_ids.filtered(lambda x: x.state != "disabled").write(
+                {"state": "disabled"}
+            )
             action["params"].update(
                 {
                     "type": "warning",
@@ -942,3 +945,24 @@ class ResPartner(models.Model):
         ) or self.fr_directory_entity_type == "private_inactive":
             return True
         return False
+
+    def fr_reset_directory(self):
+        self.ensure_one()
+        self.fr_directory_line_ids.unlink()
+        self.write(
+            {
+                "fr_directory_siren": False,
+                "fr_directory_siret": False,
+            }
+        )
+        self.message_post(
+            body=Markup(
+                self.env._(
+                    "<strong>Reset of the query SIREN/SIRET</strong> "
+                    "and deletion of all directory lines. "
+                    "Reminder: this feature is dangerous, it should not be used to "
+                    "change a partner that is already linked to invoices or other "
+                    "business documents in Odoo to point to another legal entity."
+                )
+            )
+        )

@@ -76,7 +76,6 @@ class ResCompany(models.Model):
     )
     fr_ctc_auto_reverse = fields.Boolean(
         string="Auto Reverse Invoice if Refused/Rejected",
-        default=True,
     )
     fr_ctc_event_auto_send_in_hand = fields.Boolean(
         string="Auto Send In Hand Event",
@@ -127,6 +126,9 @@ class ResCompany(models.Model):
     )
     fr_ctc_get_in_invoice = fields.Boolean(
         default=True, string="Get Vendor Bills from AP"
+    )
+    fr_ctc_auto_download_readable_invoice = fields.Boolean(
+        default=True, string="Auto Download Readable Invoice from AP"
     )
 
     @api.depends("fr_ctc_auth_method")
@@ -447,6 +449,7 @@ class ResCompany(models.Model):
             "syntax": flow_dict.get("flowSyntax"),
             "type": flow_dict.get("flowType"),
             "processing_rule": flow_dict.get("processingRule"),
+            "profile": flow_dict.get("flowProfile"),
             "updated_at": flow_dict.get("updated_at"),
             "submitted_at": flow_dict.get(
                 "submitted_at"
@@ -554,7 +557,9 @@ class ResCompany(models.Model):
             running_env = tools.config.get("running_env")
             siren = self.partner_id._get_siren(raise_if_none=True)
             optional_uri_params = {"superpdp_company_number": siren}
-            if running_env in ("test", "dev"):
+            if running_env in ("test", "dev") or self.env[
+                "ir.config_parameter"
+            ].sudo().get_param("database.is_neutralized"):
                 optional_uri_params["superpdp_company_number_scheme"] = "sandbox"
             else:
                 optional_uri_params["superpdp_company_number_scheme"] = "fr_siren"
@@ -610,7 +615,16 @@ class ResCompany(models.Model):
         # WARNING: Burger Queen and Tricatel suffixes are different in earch sandbox
         # so you MUST customize the 2 arguments
         logger.info("Start to create a SUPER PDP sandbox")
-        if tools.config.get("running_env") not in ("test", "dev"):
+        running_env = tools.config.get("running_env", False)
+        if not running_env and not self.env["ir.config_parameter"].sudo().get_param(
+            "database.is_neutralized"
+        ):
+            logger.warning(
+                "You are trying to create a SUPER PDP sandbox but database is not "
+                "neutralized. Aborting."
+            )
+            return False
+        elif running_env and running_env not in ("test", "dev"):
             logger.warning(
                 "You are trying to create a SUPER PDP sandbox but running_env is not "
                 "test/dev. Aborting."

@@ -64,6 +64,14 @@
                         invisible="state not in ('error', 'created', 'generated', 'downloaded')"
                         groups="account.group_account_manager"
                     />
+                    <button
+                        name="delete_draft_invoice"
+                        type="object"
+                        string="Delete draft Vendor Bill and go back to Downloaded"
+                        groups="account.group_account_manager"
+                        confirm="Are you sure you want to delete the draft vendor bill and go back to Downloaded state?"
+                        invisible="move_state != 'draft'"
+                    />
                     <field
                         name="state"
                         widget="statusbar"
@@ -78,16 +86,6 @@
                     />
                 </header>
                 <sheet>
-                    <div class="oe_button_box" name="button_box">
-                        <button
-                            class="oe_stat_button"
-                            type="object"
-                            name="show_invoices_button"
-                            invisible="not move_ids"
-                            icon="fa-pencil-square-o"
-                            string="Invoice"
-                        />
-                    </div>
                     <div class="oe_title">
                         <label for="identifier" />
                         <h1>
@@ -103,29 +101,37 @@
                                 decoration-warning="direction == 'out'"
                             />
                             <field name="event_id" invisible="not event_id" />
+                            <field name="event_date" invisible="not event_id" />
                             <field
                                 name="auto_internal_move_id"
                                 invisible="not auto_internal_move_id"
                             />
                             <field name="move_id" invisible="not move_id" />
+                            <field name="move_invoice_date" invisible="not move_id" />
+                            <field name="move_state" invisible="1" />
+                            <field name="partner_id" />
                             <field name="type" />
                             <field name="syntax" />
                             <field
-                                name="odoo_invoice_format"
-                                invisible="direction != 'out' or syntax not in ('UBL', 'CII', 'Factur-X')"
+                                name="invoice_format"
+                                invisible="type not in ('SupplierInvoice', 'CustomerInvoice')"
                             />
-                            <field name="profile" />
-                            <field name="processing_rule" />
                             <field
-                                name="company_id"
-                                groups="base.group_multi_company"
+                                name="in_invoice_scenario"
+                                invisible="type != 'SupplierInvoice'"
                             />
+                            <field name="profile" invisible="not profile" />
+                            <field name="processing_rule" />
                         </group>
                         <group name="main-right">
                             <field name="file_bin" filename="filename" />
                             <field name="filename" invisible="1" />
                             <field name="submitted_at" invisible="direction == 'in'" />
                             <field name="updated_at" />
+                            <field
+                                name="company_id"
+                                groups="base.group_multi_company"
+                            />
                             <field
                                 name="fr_directory_line_peppol_status"
                                 invisible="direction != 'out' or (not move_id and not event_id)"
@@ -137,10 +143,6 @@
                             <field
                                 name="ap_error_details"
                                 invisible="not ap_error_details"
-                            />
-                            <field
-                                name="odoo_error_details"
-                                invisible="not odoo_error_details"
                             />
                             <field
                                 name="cancel_comment"
@@ -163,10 +165,17 @@
                         <field name="event_ids" nolabel="1" colspan="2" />
                     </group>
                     <group
-                        name="data_dict"
+                        name="odoo_error_details"
+                        string="Odoo Errors"
+                        invisible="not odoo_error_details"
+                    >
+                        <field name="odoo_error_details" nolabel="1" colspan="2" />
+                    </group>
+                    <group
+                        name="data_dict_txt"
                         string="Data Map for debug"
                         groups="base.group_no_one"
-                        invisible="not data_dict"
+                        invisible="not data_dict_txt"
                     >
                         <field
                             name="data_dict_txt"
@@ -221,6 +230,7 @@
                 />
                 <field name="move_id" optional="show" />
                 <field name="event_id" optional="show" />
+                <field name="partner_id" optional="show" />
                 <field name="type" optional="show" />
                 <field name="syntax" optional="hide" />
                 <field name="profile" optional="hide" />
@@ -253,6 +263,26 @@
                     string="Identifier or Invoice"
                     filter_domain="['|', '|', ('identifier', 'ilike', self), ('move_id', 'ilike', self), ('auto_internal_move_id', '=', self)]"
                 />
+                <field name="partner_id" />
+                <filter name="in" string="In" domain="[('direction', '=', 'in')]" />
+                <filter name="out" string="Out" domain="[('direction', '=', 'out')]" />
+                <separator />
+                <filter
+                    name="invoice_syntax"
+                    string="Invoice"
+                    domain="[('syntax', 'in', ('UBL', 'CII', 'Factur-X'))]"
+                />
+                <filter
+                    name="cadr_syntax"
+                    string="Event"
+                    domain="[('syntax', '=', 'CDAR')]"
+                />
+                <filter
+                    name="frr_syntax"
+                    string="eReporting"
+                    domain="[('syntax', '=', 'FRR')]"
+                />
+
                 <separator />
                 <filter
                     name="state_created"
@@ -290,42 +320,27 @@
                     domain="[('state', '=', 'ap_unknown')]"
                 />
                 <separator />
-                <filter name="in" string="In" domain="[('direction', '=', 'in')]" />
-                <filter name="out" string="Out" domain="[('direction', '=', 'out')]" />
-                <separator />
-                <filter name="cii" string="CII" domain="[('syntax', '=', 'CII')]" />
-                <filter name="ubl" string="UBL" domain="[('syntax', '=', 'UBL')]" />
-                <filter
-                    name="facturx"
-                    string="Factur-X"
-                    domain="[('syntax', '=', 'Factur-X')]"
-                />
-                <filter name="cadr" string="CDAR" domain="[('syntax', '=', 'CDAR')]" />
-                <filter
-                    name="frr"
-                    string="eReporting"
-                    domain="[('syntax', '=', 'FRR')]"
-                />
                 <group name="groupby">
                     <filter
-                        name="state_groupby"
-                        string="State"
-                        context="{'group_by': 'state'}"
+                        name="direction_groupby"
+                        string="Direction"
+                        context="{'group_by': 'direction'}"
                     />
                     <filter
                         name="type_groupby"
                         string="Type"
                         context="{'group_by': 'type'}"
                     />
+
+                    <filter
+                        name="state_groupby"
+                        string="State"
+                        context="{'group_by': 'state'}"
+                    />
                     <filter
                         name="syntax_groupby"
                         string="Syntax"
                         context="{'group_by': 'syntax'}"
-                    />
-                    <filter
-                        name="profile_groupby"
-                        string="Profile"
-                        context="{'group_by': 'profile'}"
                     />
                     <filter
                         name="processing_rule_groupby"

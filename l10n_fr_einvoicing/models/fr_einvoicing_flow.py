@@ -1,11 +1,11 @@
-# Copyright 2026 Akretion France (http://www.akretion.com/)
+# Copyright 2026 Akretion France (https://www.akretion.com/)
 # @author: Alexis de Lattre <alexis.delattre@akretion.com>
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
 import base64
-import json
 import logging
 import time
+import traceback
 from pprint import pformat
 
 from markupsafe import Markup
@@ -15,7 +15,7 @@ from stdnum.fr.siret import is_valid as siret_is_valid
 
 from odoo import Command, api, fields, models
 from odoo.exceptions import UserError
-from odoo.tools import json_default
+from odoo.tools.misc import format_date
 
 from .res_partner import SUPERPDP_SANDBOX_SIREN
 
@@ -48,7 +48,9 @@ class FrEinvoicingFlow(models.Model):
     # I don't usually do that, but I think it's the best option for such
     # a technical object that users won't use much
     identifier = fields.Char(readonly=True, tracking=True)  # flowId
-    company_id = fields.Many2one("res.company", ondelete="cascade", required=True)
+    company_id = fields.Many2one(
+        "res.company", ondelete="cascade", required=True, readonly=True
+    )
     direction = fields.Selection(
         [  # flowDirection
             ("in", "In"),
@@ -103,7 +105,7 @@ class FrEinvoicingFlow(models.Model):
         ],
         readonly=True,
     )
-    odoo_invoice_format = fields.Selection(
+    invoice_format = fields.Selection(
         [
             ("facturx", "Factur-X"),
             ("ubl_pdf", "UBL XML with embedded PDF file"),
@@ -112,7 +114,15 @@ class FrEinvoicingFlow(models.Model):
             ("cii", "CII XML"),
         ],
         readonly=True,
-    )  # Only for out flows, when syntax in (UBL, CII, Factur-X)
+    )  # Now used both for in and out invoice flows
+    in_invoice_scenario = fields.Selection(
+        [
+            ("created", "Vendor Bill Created"),
+            ("matched", "Matched an Existing Vendor Bill"),
+        ],
+        string="Invoice Scenario",
+        readonly=True,
+    )
     profile = fields.Selection(
         [  # flowProfile
             ("Basic", "Basic"),
@@ -169,14 +179,20 @@ class FrEinvoicingFlow(models.Model):
         "account.move", "fr_einvoicing_flow_id", string="Invoices", readonly=True
     )
     move_id = fields.Many2one(
-        "account.move", compute="_compute_move_id", store=True, string="Invoice"
+        "account.move", compute="_compute_move_event", store=True, string="Invoice"
     )
+    move_invoice_date = fields.Date(related="move_id.invoice_date")
+    move_state = fields.Selection(related="move_id.state")
     event_ids = fields.One2many(
         "fr.einvoicing.event", "flow_id", readonly=True, string="Events"
     )
     event_id = fields.Many2one(
-        "fr.einvoicing.event", compute="_compute_event_id", store=True
+        "fr.einvoicing.event", compute="_compute_move_event", store=True
     )
+    partner_id = fields.Many2one(
+        "res.partner", compute="_compute_move_event", store=True
+    )
+    event_date = fields.Date(related="event_id.date")
     auto_internal_move_id = fields.Many2one(
         "account.move", string="Auto-generated Internal Refund/Invoice", readonly=True
     )
@@ -186,9 +202,6 @@ class FrEinvoicingFlow(models.Model):
         string="PEPPOL Status of Directory Line",
         help="PEPPOL status of directory line when flow is sent to the AP",
     )
-    data_dict = fields.Json(readonly=True, string="JSON Data Map")
-    # maybe we'll drop this field data_dict_txt once web_widget_json will be merged
-    # https://github.com/OCA/web/pull/3231
     data_dict_txt = fields.Text(readonly=True, string="Text Data Map")
     # state côté PA / côté Odoo ?
     # initial M2M
@@ -219,17 +232,26 @@ class FrEinvoicingFlow(models.Model):
                 name = f"{name} ({state2label.get(flow.state)})"
             flow.display_name = name
 
-    @api.depends("move_ids")
-    def _compute_move_id(self):
+    @api.depends("move_ids", "move_ids.commercial_partner_id", "event_ids")
+    def _compute_move_event(self):
         for flow in self:
+            move_id = event_id = partner_id = False
             if flow.move_ids and len(flow.move_ids) == 1:
-                flow.move_id = flow.move_ids
+                move = flow.move_ids
+                move_id = move.id
+                partner_id = move.commercial_partner_id.id or False
+            elif flow.event_ids and len(flow.event_ids) == 1:
+                event = flow.event_ids
+                event_id = event.id
+                partner_id = event.move_id.commercial_partner_id
+            flow.move_id = move_id
+            flow.event_id = event_id
+            flow.partner_id = partner_id
 
     @api.depends("event_ids")
     def _compute_event_id(self):
         for flow in self:
-            if flow.event_ids and len(flow.event_ids) == 1:
-                flow.event_id = flow.event_ids
+            flow.event_id = flow.event_ids
 
     def write(self, vals):
         self._common_update_data_dict(vals)
@@ -248,12 +270,9 @@ class FrEinvoicingFlow(models.Model):
                 # for txt, I used pformat() instead of json.dumps to have
                 # a nice display of accented chararacters
                 vals["data_dict_txt"] = pformat(vals["data_dict"])
-                vals["data_dict"] = json.loads(
-                    json.dumps(vals["data_dict"], default=json_default)
-                )
             else:
-                vals["data_dict"] = False
                 vals["data_dict_txt"] = False
+            vals.pop("data_dict")
 
     def generate_button(self):
         log_obj = self.env["fr.einvoicing.log"]
@@ -272,7 +291,6 @@ class FrEinvoicingFlow(models.Model):
             flow._generate(result)
         return self._create_log_prepare_notif_action(
             result,
-            self.env._("Generate flow file"),
             self.env._("%(count)s flow file(s) successfully generated."),
             self.env._("No flow file generated."),
             self.env._(
@@ -337,10 +355,10 @@ class FrEinvoicingFlow(models.Model):
             assert len(self.move_ids) == 1
             move = self.move_ids
             if self.syntax in ("Factur-X", "UBL", "CII"):
-                filename = move._prepare_en16931_filename(self.odoo_invoice_format)
+                filename = move._prepare_en16931_filename(self.invoice_format)
                 try:
                     file_b64, data_dict = move._get_en16931_invoice_bin(
-                        self.odoo_invoice_format, b64=True
+                        self.invoice_format, b64=True
                     )
                 except Exception as err:
                     msg = (
@@ -397,18 +415,19 @@ class FrEinvoicingFlow(models.Model):
             flow._send(session, result)
         return self._create_log_prepare_notif_action(
             result,
-            self.env._("Send flows"),
             self.env._("%(count)s flow(s) successfully sent."),
             self.env._("No flow sent."),
             self.env._("%(count)s flow(s) failed to be sent: see logs for error."),
         )
 
     def _create_log_prepare_notif_action(
-        self, result, title, success_msg, no_msg, failure_msg
+        self, result, success_msg, no_msg, failure_msg
     ):
-        self.env["fr.einvoicing.log"]._create_log(result)
+        log = self.env["fr.einvoicing.log"]._create_log(result)
         msg_list = []
         notif_type = "success"
+        # we don't display the logs in the notification pop-up itself because they are
+        # not translated. We just invite users to have a look at the logs
         if result["updated_count"]:
             msg_list.append(success_msg % {"count": result["updated_count"]})
         else:
@@ -427,14 +446,26 @@ class FrEinvoicingFlow(models.Model):
             "tag": "display_notification",
             "params": {
                 "type": notif_type,
-                "title": title,
-                "message": " ".join(msg_list),
+                "title": " ".join(msg_list),
                 "next": {  # refresh data on current page
                     "type": "ir.actions.client",
                     "tag": "soft_reload",
                 },
             },
         }
+        if notif_type != "success":
+            action["params"].update(
+                {
+                    "sticky": True,
+                    "message": "%s",  # %s is needed to make "links" works
+                    "links": [
+                        {
+                            "label": self.env._("Display Log"),
+                            "url": f"/odoo/fr-einvoicing-log/{log.id}",
+                        }
+                    ],
+                }
+            )
         return action
 
     def _send(self, session, result):
@@ -442,50 +473,58 @@ class FrEinvoicingFlow(models.Model):
         log_obj = self.env["fr.einvoicing.log"]
         if self.direction != "out":
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} "
+                f"Skip sending of flow {self.display_name} "
                 f"because its direction is {self.direction}"
             )
             log_obj._info_log(result, msg)
             return
         if self.state != "generated":
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} "
+                f"Skip sending of flow {self.display_name} "
                 f"because its state is '{self.state}' and not 'generated'"
             )
             log_obj._info_log(result, msg)
             return
         if not self.file_bin:
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} because there "
+                f"Skip sending of flow {self.display_name} because there "
                 "is no attached file"
             )
             log_obj._warning_log(result, msg)
             return
         if not self.filename:
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} because the "
+                f"Skip sending of flow {self.display_name} because the "
                 "filename is not set"
             )
             log_obj._warning_log(result, msg)
             return
         if not self.syntax:
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} because the "
+                f"Skip sending of flow {self.display_name} because the "
                 "syntax is not set"
             )
             log_obj._warning_log(result, msg)
             return
         if not self.processing_rule:
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} because the "
+                f"Skip sending of flow {self.display_name} because the "
                 "processing rule is not set"
             )
             log_obj._warning_log(result, msg)
             return
         if self.identifier:
             msg = (
-                f"Skip sending of flow {self.display_name} ID {self.id} because it "
+                f"Skip sending of flow {self.display_name} because it "
                 "already has an identifier, which means it has already been sent"
+            )
+            log_obj._warning_log(result, msg)
+            return
+        if self.move_id and self.move_id.invoice_date > fields.Date.context_today(self):
+            msg = (
+                f"Skip sending of flow {self.display_name} because the "
+                f"related invoice {self.move_id.display_name} is dated in the future "
+                f"({format_date(self.env, self.move_id.invoice_date)})"
             )
             log_obj._warning_log(result, msg)
             return
@@ -550,7 +589,6 @@ class FrEinvoicingFlow(models.Model):
 
         return self._create_log_prepare_notif_action(
             result,
-            self.env._("Download from AP"),
             self.env._("%(count)s flow(s) successfully downloaded."),
             self.env._("No flow downloaded."),
             self.env._(
@@ -625,7 +663,6 @@ class FrEinvoicingFlow(models.Model):
             flow._process(result)
         return self._create_log_prepare_notif_action(
             result,
-            self.env._("Process flows"),
             self.env._("%(count)s flow(s) successfully processed."),
             self.env._("No flow processed."),
             self.env._("%(count)s flow(s) failed to be processed: see logs for error."),
@@ -636,7 +673,9 @@ class FrEinvoicingFlow(models.Model):
         If you don't want to use the OCA module account_invoice_import, you can develop
         an alternative to l10n_fr_einvoicing_import and inherit this method"""
         self.ensure_one()
-        return False
+        invoice = False
+        flow_vals = {}
+        return (invoice, flow_vals)
 
     def _process(self, result):  # noqa: C901
         self.ensure_one()
@@ -665,36 +704,60 @@ class FrEinvoicingFlow(models.Model):
         msg = f"Start to process flow {self.display_name} ID {self.id} type {self.type}"
         log_obj._info_log(result, msg)
         if self.type == "SupplierInvoice":
-            move_id = error = None
+            move = error = backtrace_str = None
+            flow_vals = {}
             try:
-                move_id = self._import_supplier_invoice(result)
-            except Exception as err:
+                # savepoint: on failure, we don't want to leave in the database a
+                # partial invoice. The creation can raise AFTER the INSERT (for example
+                # on the 'Incompatible companies on records' constraint) and, since the
+                # exception is catched here, the transaction is not rolled back.
+                # Don't replace it by a cr.rollback() in the except: that would rollback
+                # the whole transaction of the job
+                with self.env.cr.savepoint():
+                    move, flow_vals = self._import_supplier_invoice(result)
+            except UserError as err:
                 error = str(err)
                 msg = (
-                    f"Error in creation of the supplier invoice/refund from flow "
+                    f"Error in the creation of the supplier invoice/refund from flow "
                     f"{self.display_name} ID {self.id}: {error}"
                 )
                 log_obj._warning_log(result, msg)
-            if move_id:
-                flow_vals = {"state": "done"}
+            except Exception as err:
+                error = str(err)
+                backtrace_str = traceback.format_exc()
+                msg = (
+                    f"Crash in the creation of the supplier invoice/refund from flow "
+                    f"{self.display_name} ID {self.id}: {error}"
+                )
+                log_obj._warning_log(result, msg)
+            if move:
+                flow_vals.update({"state": "done"})
                 if "updated_count" in result:
                     result["updated_count"] += 1
                 if self.company_id.fr_ctc_event_auto_send_in_hand:
-                    move = self.env["account.move"].browse(move_id)
                     event = move._fr_ctc_create_simple_event("in_hand")
                     msg = (
                         f"In hand event ID {event.id} successfully created "
-                        f"for invoice ID {move_id}"
+                        f"for invoice {move.display_name} ID {move.id}"
                     )
                     log_obj._info_log(result, msg)
             else:
-                err_details = "Odoo failed to created the supplier invoice/refund."
-                if error:
-                    err_details += f" Error: {error}"
-                flow_vals = {
-                    "state": "error",
-                    "odoo_error_details": err_details,
-                }
+                if backtrace_str:
+                    err_details = (
+                        f"Odoo crashed while trying to create the supplier "
+                        f"invoice/refund.\n----- Backtrace -----\n{backtrace_str}"
+                    )
+                else:
+                    err_details = (
+                        f"Odoo raised the following error during the creation of the "
+                        f"supplier invoice/refund: {error}"
+                    )
+                flow_vals.update(
+                    {
+                        "state": "error",
+                        "odoo_error_details": err_details,
+                    }
+                )
                 msg = (
                     f"Odoo failed to create the supplier invoice/refund. "
                     f"Flow {self.display_name} ID {self.id} set to error state."
@@ -929,6 +992,14 @@ class FrEinvoicingFlow(models.Model):
             )
             log_obj._warning_log(result, msg)
             return False
+        if move.reversed_entry_id:
+            msg = (
+                f"No auto-reversal because invoice {move.display_name} "
+                f"ID {move.id} is already a reverse of move "
+                f"{move.reversed_entry_id.display_name}."
+            )
+            log_obj._warning_log(result, msg)
+            return False
         lang = move.partner_id.lang
         status_label = dict(
             event._fields["status"]._description_selection(
@@ -1059,7 +1130,6 @@ class FrEinvoicingFlow(models.Model):
             flow._update_status(session, result)
         return self._create_log_prepare_notif_action(
             result,
-            self.env._("Flow status update"),
             self.env._("%(count)s flow(s) status updated."),
             self.env._("No flow status updated."),
             self.env._(
@@ -1310,8 +1380,29 @@ class FrEinvoicingFlow(models.Model):
                 "filename": False,
                 "ap_error_details": False,
                 "odoo_error_details": False,
-                "data_dict": False,
                 "data_dict_txt": False,
                 "cancel_comment": False,
+            }
+        )
+
+    def delete_draft_invoice(self):
+        self.ensure_one()
+        assert self.move_id
+        assert self.move_id.state == "draft"
+        self.sudo().message_post(
+            body=Markup(
+                self.env._(
+                    "Deleting the draft Vendor Bill <strong>%s</strong>.",
+                    self.move_id.display_name,
+                )
+            )
+        )
+        self.move_id.with_context(fr_einvoicing_force_unlink=True).unlink()
+        self.sudo().write(
+            {
+                "ap_error_details": False,
+                "odoo_error_details": False,
+                "state": "downloaded",
+                "data_dict_txt": False,
             }
         )
