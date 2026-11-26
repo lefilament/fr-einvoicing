@@ -97,6 +97,7 @@ class AccountMove(models.Model):
         store=True,
         readonly=False,
         tracking=True,
+        copy=False,
         help="Business Term BT-3 in EN16931",
     )
     # we disallow manual modification for the moment, because we would
@@ -785,6 +786,15 @@ class AccountMove(models.Model):
                 check_schematron = "fr-ctc"
             elif self.fr_directory_partner_entity_type == "public":
                 check_schematron = "fr-chorus"
+        # Do not check schematron in case move is posted,
+        # and directory line field exists but is not set
+        # (e.g. Invoice posted before directory line becomes mandatory)
+        if (
+            self.state == "posted"
+            and hasattr(self, "fr_directory_line_id")
+            and not self.fr_directory_line_id
+        ):
+            check_schematron = False
         saxon_server_url = self._get_specific_saxon_server_url()
         saxon_server_codedb_dir = self._get_saxon_server_codedb_dir()
         saxon_server_codedb_base_url = self._get_saxon_server_codedb_base_url()
